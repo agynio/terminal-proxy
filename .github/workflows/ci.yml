@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          version: 1.66.0
+
+      - name: Generate protobuf bindings
+        run: |
+          buf generate buf.build/agynio/api \
+            --include-imports \
+            --path agynio/api/terminal_proxy/v1 \
+            --path agynio/api/runner/v1 \
+            --path agynio/api/runners/v1 \
+            --path agynio/api/agents/v1 \
+            --path agynio/api/ziti_management/v1
+
+      - name: Run tests
+        run: CGO_ENABLED=0 go test ./...
+
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...

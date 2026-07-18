@@ -1,0 +1,398 @@
+package proxy
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	agentsv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/agents/v1"
+	runnerv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runner/v1"
+	runnersv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runners/v1"
+	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
+	"github.com/agynio/terminal-proxy/internal/runnerdial"
+	"github.com/agynio/terminal-proxy/internal/ticket"
+	"github.com/google/uuid"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"nhooyr.io/websocket"
+)
+
+const (
+	defaultShell = "exec ${SHELL:-sh} -l"
+)
+
+type RunnersClient interface {
+	GetWorkload(context.Context, *runnersv1.GetWorkloadRequest, ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error)
+	TouchWorkload(context.Context, *runnersv1.TouchWorkloadRequest, ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error)
+}
+
+type AgentsClient interface {
+	UpdateSandboxLastSession(context.Context, *agentsv1.UpdateSandboxLastSessionRequest, ...grpc.CallOption) (*agentsv1.UpdateSandboxLastSessionResponse, error)
+}
+
+type Config struct {
+	Tickets       *ticket.Store
+	TicketTTL     time.Duration
+	WebSocketURL  string
+	Runners       RunnersClient
+	Agents        AgentsClient
+	RunnerDialer  runnerdial.RunnerDialer
+	TouchInterval time.Duration
+}
+
+type Server struct {
+	terminalproxyv1.UnimplementedTerminalProxyServiceServer
+	tickets       *ticket.Store
+	ticketTTL     time.Duration
+	webSocketURL  string
+	runners       RunnersClient
+	agents        AgentsClient
+	runnerDialer  runnerdial.RunnerDialer
+	touchInterval time.Duration
+}
+
+type handshake struct {
+	Cols uint32 `json:"cols"`
+	Rows uint32 `json:"rows"`
+}
+
+type controlFrame struct {
+	Type string `json:"type"`
+	Cols uint32 `json:"cols,omitempty"`
+	Rows uint32 `json:"rows,omitempty"`
+}
+
+type exitFrame struct {
+	Type   string `json:"type"`
+	Code   int32  `json:"code"`
+	Reason string `json:"reason"`
+}
+
+func New(cfg Config) (*Server, error) {
+	if cfg.Tickets == nil {
+		return nil, errors.New("ticket store missing")
+	}
+	if cfg.TicketTTL <= 0 {
+		return nil, errors.New("ticket ttl must be greater than 0")
+	}
+	if strings.TrimSpace(cfg.WebSocketURL) == "" {
+		return nil, errors.New("websocket url missing")
+	}
+	if cfg.Runners == nil {
+		return nil, errors.New("runners client missing")
+	}
+	if cfg.Agents == nil {
+		return nil, errors.New("agents client missing")
+	}
+	if cfg.RunnerDialer == nil {
+		return nil, errors.New("runner dialer missing")
+	}
+	if cfg.TouchInterval <= 0 {
+		return nil, errors.New("touch interval must be greater than 0")
+	}
+	return &Server{
+		tickets:       cfg.Tickets,
+		ticketTTL:     cfg.TicketTTL,
+		webSocketURL:  strings.TrimSpace(cfg.WebSocketURL),
+		runners:       cfg.Runners,
+		agents:        cfg.Agents,
+		runnerDialer:  cfg.RunnerDialer,
+		touchInterval: cfg.TouchInterval,
+	}, nil
+}
+
+func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTicketRequest) (*terminalproxyv1.IssueTicketResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request required")
+	}
+	token, expiresAt, err := s.tickets.Issue(req.GetIdentityId(), req.GetWorkloadId(), req.GetContainerName(), req.GetCommand(), s.ticketTTL)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	expiresIn := int32(time.Until(expiresAt).Seconds())
+	if expiresIn < 1 {
+		expiresIn = 1
+	}
+	return &terminalproxyv1.IssueTicketResponse{Ticket: token, WebsocketUrl: s.webSocketURL, ExpiresInSeconds: expiresIn}, nil
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/terminal" {
+		http.NotFound(w, r)
+		return
+	}
+	rawTicket := strings.TrimSpace(r.URL.Query().Get("ticket"))
+	if rawTicket == "" {
+		http.Error(w, "ticket required", http.StatusUnauthorized)
+		return
+	}
+	claims, err := s.tickets.Consume(rawTicket)
+	if err != nil {
+		http.Error(w, "ticket invalid", http.StatusUnauthorized)
+		return
+	}
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	if err := s.handleSession(r.Context(), conn, claims); err != nil {
+		log.Printf("terminal session %s failed: %v", claims.ID, err)
+	}
+}
+
+func (s *Server) handleSession(ctx context.Context, conn *websocket.Conn, claims *ticket.Claims) error {
+	handshake, err := readHandshake(ctx, conn)
+	if err != nil {
+		return closeWithError(ctx, conn, websocket.StatusPolicyViolation, err.Error())
+	}
+	workload, err := s.loadWorkload(ctx, claims.WorkloadID)
+	if err != nil {
+		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+	}
+	targetID, err := execTargetID(workload, claims.ContainerName)
+	if err != nil {
+		return closeWithError(ctx, conn, websocket.StatusPolicyViolation, err.Error())
+	}
+	runnerID := strings.TrimSpace(workload.GetRunnerId())
+	if runnerID == "" {
+		return closeWithError(ctx, conn, websocket.StatusInternalError, "runner id missing")
+	}
+	runnerClient, err := s.runnerDialer.Dial(ctx, runnerID)
+	if err != nil {
+		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+	}
+	execStream, err := runnerClient.Exec(ctx)
+	if err != nil {
+		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+	}
+	if err := execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Start{Start: startRequest(claims, targetID)}}); err != nil {
+		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+	}
+	if err := sendResize(execStream, handshake.Cols, handshake.Rows); err != nil {
+		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+	}
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if workload.GetOwnerKind() == runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX {
+		go s.touchSandboxWorkload(sessionCtx, workload.GetMeta().GetId())
+		defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
+	}
+	errCh := make(chan error, 2)
+	go func() { errCh <- websocketToExec(sessionCtx, conn, execStream) }()
+	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream) }()
+	err = <-errCh
+	cancel()
+	if err == nil || errors.Is(err, context.Canceled) || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) loadWorkload(ctx context.Context, workloadID string) (*runnersv1.Workload, error) {
+	resp, err := s.runners.GetWorkload(ctx, &runnersv1.GetWorkloadRequest{Id: workloadID})
+	if err != nil {
+		return nil, fmt.Errorf("get workload %s: %w", workloadID, err)
+	}
+	workload := resp.GetWorkload()
+	if workload == nil || workload.GetMeta() == nil || workload.GetMeta().GetId() == "" {
+		return nil, errors.New("workload missing")
+	}
+	return workload, nil
+}
+
+func (s *Server) touchSandboxWorkload(ctx context.Context, workloadID string) {
+	s.touchWorkload(ctx, workloadID)
+	ticker := time.NewTicker(s.touchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.touchWorkload(ctx, workloadID)
+		}
+	}
+}
+
+func (s *Server) touchWorkload(ctx context.Context, workloadID string) {
+	if strings.TrimSpace(workloadID) == "" {
+		return
+	}
+	if _, err := s.runners.TouchWorkload(ctx, &runnersv1.TouchWorkloadRequest{Id: workloadID}); err != nil && ctx.Err() == nil {
+		log.Printf("touch workload %s: %v", workloadID, err)
+	}
+}
+
+func (s *Server) updateSandboxLastSession(ctx context.Context, sandboxID string) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	_, err := s.agents.UpdateSandboxLastSession(ctx, &agentsv1.UpdateSandboxLastSessionRequest{
+		Id:            sandboxID,
+		LastSessionAt: timestamppb.New(time.Now().UTC()),
+	})
+	if err != nil {
+		log.Printf("update sandbox last session %s: %v", sandboxID, err)
+	}
+}
+
+func readHandshake(ctx context.Context, conn *websocket.Conn) (handshake, error) {
+	messageType, data, err := conn.Read(ctx)
+	if err != nil {
+		return handshake{}, err
+	}
+	if messageType != websocket.MessageText {
+		return handshake{}, errors.New("handshake must be a JSON text frame")
+	}
+	var hs handshake
+	if err := json.Unmarshal(data, &hs); err != nil {
+		return handshake{}, errors.New("handshake JSON invalid")
+	}
+	if hs.Cols == 0 || hs.Rows == 0 {
+		return handshake{}, errors.New("handshake cols and rows are required")
+	}
+	return hs, nil
+}
+
+func startRequest(claims *ticket.Claims, targetID string) *runnerv1.ExecStartRequest {
+	start := &runnerv1.ExecStartRequest{
+		RequestId: claims.ID,
+		TargetId:  targetID,
+		Options:   &runnerv1.ExecOptions{Tty: true},
+	}
+	if len(claims.CommandArgv) > 0 {
+		start.CommandArgv = append([]string(nil), claims.CommandArgv...)
+	} else if strings.TrimSpace(claims.CommandShell) != "" {
+		start.CommandShell = claims.CommandShell
+	} else {
+		start.CommandShell = defaultShell
+	}
+	return start
+}
+
+func execTargetID(workload *runnersv1.Workload, containerName string) (string, error) {
+	containerName = strings.TrimSpace(containerName)
+	if containerName == "" {
+		return "", errors.New("container name missing")
+	}
+	for _, container := range workload.GetContainers() {
+		if container.GetName() != containerName {
+			continue
+		}
+		targetID := strings.TrimSpace(container.GetContainerId())
+		if targetID == "" {
+			return "", fmt.Errorf("container %s target id missing", containerName)
+		}
+		return targetID, nil
+	}
+	return "", fmt.Errorf("container %s not found", containerName)
+}
+
+func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runnerv1.RunnerService_ExecClient) error {
+	for {
+		messageType, data, err := conn.Read(ctx)
+		if err != nil {
+			_ = execStream.CloseSend()
+			return err
+		}
+		switch messageType {
+		case websocket.MessageBinary:
+			if err := execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Stdin{Stdin: &runnerv1.ExecStdin{Data: data}}}); err != nil {
+				return err
+			}
+		case websocket.MessageText:
+			var frame controlFrame
+			if err := json.Unmarshal(data, &frame); err != nil {
+				return err
+			}
+			if frame.Type != "resize" {
+				return fmt.Errorf("unsupported control frame %q", frame.Type)
+			}
+			if err := sendResize(execStream, frame.Cols, frame.Rows); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func execToWebsocket(ctx context.Context, conn *websocket.Conn, execStream runnerv1.RunnerService_ExecClient) error {
+	for {
+		resp, err := execStream.Recv()
+		if errors.Is(err, io.EOF) {
+			return conn.Close(websocket.StatusNormalClosure, "exec complete")
+		}
+		if err != nil {
+			_ = writeExit(ctx, conn, 1, "error")
+			return err
+		}
+		switch event := resp.GetEvent().(type) {
+		case *runnerv1.ExecResponse_Stdout:
+			if err := conn.Write(ctx, websocket.MessageBinary, event.Stdout.GetData()); err != nil {
+				return err
+			}
+		case *runnerv1.ExecResponse_Stderr:
+			if err := conn.Write(ctx, websocket.MessageBinary, event.Stderr.GetData()); err != nil {
+				return err
+			}
+		case *runnerv1.ExecResponse_Exit:
+			reason := exitReason(event.Exit.GetReason())
+			if err := writeExit(ctx, conn, event.Exit.GetExitCode(), reason); err != nil {
+				return err
+			}
+			return nil
+		case *runnerv1.ExecResponse_Error:
+			_ = writeExit(ctx, conn, 1, "error")
+			return fmt.Errorf("runner exec error %s: %s", event.Error.GetCode(), event.Error.GetMessage())
+		}
+	}
+}
+
+func sendResize(execStream runnerv1.RunnerService_ExecClient, cols, rows uint32) error {
+	if cols == 0 || rows == 0 {
+		return errors.New("resize cols and rows are required")
+	}
+	return execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Resize{Resize: &runnerv1.ExecResize{Cols: cols, Rows: rows}}})
+}
+
+func writeExit(ctx context.Context, conn *websocket.Conn, code int32, reason string) error {
+	payload, err := json.Marshal(exitFrame{Type: "exit", Code: code, Reason: reason})
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, websocket.MessageText, payload)
+}
+
+func exitReason(reason runnerv1.ExecExitReason) string {
+	switch reason {
+	case runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED:
+		return "completed"
+	case runnerv1.ExecExitReason_EXEC_EXIT_REASON_CANCELLED:
+		return "cancelled"
+	case runnerv1.ExecExitReason_EXEC_EXIT_REASON_TIMEOUT, runnerv1.ExecExitReason_EXEC_EXIT_REASON_IDLE_TIMEOUT, runnerv1.ExecExitReason_EXEC_EXIT_REASON_RUNNER_ERROR:
+		return "error"
+	case runnerv1.ExecExitReason_EXEC_EXIT_REASON_UNSPECIFIED:
+		return "error"
+	default:
+		return "error"
+	}
+}
+
+func closeWithError(ctx context.Context, conn *websocket.Conn, code websocket.StatusCode, reason string) error {
+	_ = writeExit(ctx, conn, 1, "error")
+	_ = conn.Close(code, reason)
+	return errors.New(reason)
+}
+
+func ValidateUUID(value string) error {
+	_, err := uuid.Parse(strings.TrimSpace(value))
+	return err
+}
