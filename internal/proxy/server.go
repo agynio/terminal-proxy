@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	agentsv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/agents/v1"
@@ -26,7 +27,8 @@ import (
 )
 
 const (
-	defaultShell = "exec ${SHELL:-sh} -l"
+	defaultShell       = "exec ${SHELL:-sh} -l"
+	workloadNamePrefix = "workload-"
 )
 
 type RunnersClient interface {
@@ -39,24 +41,37 @@ type AgentsClient interface {
 }
 
 type Config struct {
-	Tickets       *ticket.Store
-	TicketTTL     time.Duration
-	WebSocketURL  string
-	Runners       RunnersClient
-	Agents        AgentsClient
-	RunnerDialer  runnerdial.RunnerDialer
-	TouchInterval time.Duration
+	Tickets               *ticket.Store
+	TicketTTL             time.Duration
+	WebSocketURL          string
+	Runners               RunnersClient
+	Agents                AgentsClient
+	RunnerDialer          runnerdial.RunnerDialer
+	TouchInterval         time.Duration
+	WebSocketPingInterval time.Duration
+	WebSocketPingTimeout  time.Duration
 }
 
 type Server struct {
 	terminalproxyv1.UnimplementedTerminalProxyServiceServer
-	tickets       *ticket.Store
-	ticketTTL     time.Duration
-	webSocketURL  string
-	runners       RunnersClient
-	agents        AgentsClient
-	runnerDialer  runnerdial.RunnerDialer
-	touchInterval time.Duration
+	tickets               *ticket.Store
+	ticketTTL             time.Duration
+	webSocketURL          string
+	runners               RunnersClient
+	agents                AgentsClient
+	runnerDialer          runnerdial.RunnerDialer
+	touchInterval         time.Duration
+	webSocketPingInterval time.Duration
+	webSocketPingTimeout  time.Duration
+}
+
+type terminalConn struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+type websocketPinger interface {
+	Ping(context.Context) error
 }
 
 type handshake struct {
@@ -98,14 +113,22 @@ func New(cfg Config) (*Server, error) {
 	if cfg.TouchInterval <= 0 {
 		return nil, errors.New("touch interval must be greater than 0")
 	}
+	if cfg.WebSocketPingInterval <= 0 {
+		return nil, errors.New("websocket ping interval must be greater than 0")
+	}
+	if cfg.WebSocketPingTimeout <= 0 {
+		return nil, errors.New("websocket ping timeout must be greater than 0")
+	}
 	return &Server{
-		tickets:       cfg.Tickets,
-		ticketTTL:     cfg.TicketTTL,
-		webSocketURL:  strings.TrimSpace(cfg.WebSocketURL),
-		runners:       cfg.Runners,
-		agents:        cfg.Agents,
-		runnerDialer:  cfg.RunnerDialer,
-		touchInterval: cfg.TouchInterval,
+		tickets:               cfg.Tickets,
+		ticketTTL:             cfg.TicketTTL,
+		webSocketURL:          strings.TrimSpace(cfg.WebSocketURL),
+		runners:               cfg.Runners,
+		agents:                cfg.Agents,
+		runnerDialer:          cfg.RunnerDialer,
+		touchInterval:         cfg.TouchInterval,
+		webSocketPingInterval: cfg.WebSocketPingInterval,
+		webSocketPingTimeout:  cfg.WebSocketPingTimeout,
 	}, nil
 }
 
@@ -144,13 +167,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
-	if err := s.handleSession(r.Context(), conn, claims); err != nil {
+	if err := s.handleSession(r.Context(), &terminalConn{conn: conn}, claims); err != nil {
 		log.Printf("terminal session %s failed: %v", claims.ID, err)
 	}
 }
 
-func (s *Server) handleSession(ctx context.Context, conn *websocket.Conn, claims *ticket.Claims) error {
-	handshake, err := readHandshake(ctx, conn)
+func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *ticket.Claims) error {
+	hs, err := readHandshake(ctx, conn.conn)
 	if err != nil {
 		return closeWithError(ctx, conn, websocket.StatusPolicyViolation, err.Error())
 	}
@@ -170,27 +193,29 @@ func (s *Server) handleSession(ctx context.Context, conn *websocket.Conn, claims
 	if err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
-	execStream, err := runnerClient.Exec(ctx)
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	execStream, err := runnerClient.Exec(sessionCtx)
 	if err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
 	if err := execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Start{Start: startRequest(claims, targetID)}}); err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
-	if err := sendResize(execStream, handshake.Cols, handshake.Rows); err != nil {
+	if err := sendResize(execStream, hs.Cols, hs.Rows); err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	if workload.GetOwnerKind() == runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX {
 		go s.touchSandboxWorkload(sessionCtx, workload.GetMeta().GetId())
 		defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
 	}
-	errCh := make(chan error, 2)
-	go func() { errCh <- websocketToExec(sessionCtx, conn, execStream) }()
+	errCh := make(chan error, 3)
+	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream) }()
 	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream) }()
+	go func() { errCh <- websocketLiveness(sessionCtx, conn, s.webSocketPingInterval, s.webSocketPingTimeout) }()
 	err = <-errCh
 	cancel()
+	_ = conn.close(websocket.StatusNormalClosure, "terminal session ended")
 	if err == nil || errors.Is(err, context.Canceled) || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
 		return nil
 	}
@@ -284,17 +309,43 @@ func execTargetID(workload *runnersv1.Workload, containerName string) (string, e
 	if containerName == "" {
 		return "", errors.New("container name missing")
 	}
-	for _, container := range workload.GetContainers() {
-		if container.GetName() != containerName {
-			continue
-		}
-		targetID := strings.TrimSpace(container.GetContainerId())
-		if targetID == "" {
-			return "", fmt.Errorf("container %s target id missing", containerName)
-		}
-		return targetID, nil
+	container, err := findExecContainer(workload, containerName)
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("container %s not found", containerName)
+	if container.GetRole() != runnersv1.ContainerRole_CONTAINER_ROLE_MAIN {
+		return "", fmt.Errorf("container %s is not supported by current runner exec", containerName)
+	}
+	return workloadExecTargetID(workload)
+}
+
+func findExecContainer(workload *runnersv1.Workload, containerName string) (*runnersv1.Container, error) {
+	for _, container := range workload.GetContainers() {
+		if container.GetName() == containerName {
+			return container, nil
+		}
+	}
+	return nil, fmt.Errorf("container %s not found", containerName)
+}
+
+func workloadExecTargetID(workload *runnersv1.Workload) (string, error) {
+	instanceID := strings.TrimSpace(workload.GetInstanceId())
+	if instanceID != "" {
+		return runnerPodTargetID(instanceID), nil
+	}
+	workloadID := strings.TrimSpace(workload.GetMeta().GetId())
+	if workloadID == "" {
+		return "", errors.New("workload id missing")
+	}
+	return runnerPodTargetID(workloadID), nil
+}
+
+func runnerPodTargetID(id string) string {
+	id = strings.TrimSpace(id)
+	if strings.HasPrefix(id, workloadNamePrefix) {
+		return id
+	}
+	return workloadNamePrefix + id
 }
 
 func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runnerv1.RunnerService_ExecClient) error {
@@ -324,11 +375,11 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
-func execToWebsocket(ctx context.Context, conn *websocket.Conn, execStream runnerv1.RunnerService_ExecClient) error {
+func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient) error {
 	for {
 		resp, err := execStream.Recv()
 		if errors.Is(err, io.EOF) {
-			return conn.Close(websocket.StatusNormalClosure, "exec complete")
+			return conn.close(websocket.StatusNormalClosure, "exec complete")
 		}
 		if err != nil {
 			_ = writeExit(ctx, conn, 1, "error")
@@ -336,11 +387,11 @@ func execToWebsocket(ctx context.Context, conn *websocket.Conn, execStream runne
 		}
 		switch event := resp.GetEvent().(type) {
 		case *runnerv1.ExecResponse_Stdout:
-			if err := conn.Write(ctx, websocket.MessageBinary, event.Stdout.GetData()); err != nil {
+			if err := conn.write(ctx, websocket.MessageBinary, event.Stdout.GetData()); err != nil {
 				return err
 			}
 		case *runnerv1.ExecResponse_Stderr:
-			if err := conn.Write(ctx, websocket.MessageBinary, event.Stderr.GetData()); err != nil {
+			if err := conn.write(ctx, websocket.MessageBinary, event.Stderr.GetData()); err != nil {
 				return err
 			}
 		case *runnerv1.ExecResponse_Exit:
@@ -356,6 +407,42 @@ func execToWebsocket(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
+func websocketLiveness(ctx context.Context, pinger websocketPinger, interval, timeout time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, timeout)
+			err := pinger.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("websocket ping: %w", err)
+			}
+		}
+	}
+}
+
+func (c *terminalConn) Ping(ctx context.Context) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.Ping(ctx)
+}
+
+func (c *terminalConn) write(ctx context.Context, messageType websocket.MessageType, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.Write(ctx, messageType, data)
+}
+
+func (c *terminalConn) close(code websocket.StatusCode, reason string) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.Close(code, reason)
+}
+
 func sendResize(execStream runnerv1.RunnerService_ExecClient, cols, rows uint32) error {
 	if cols == 0 || rows == 0 {
 		return errors.New("resize cols and rows are required")
@@ -363,12 +450,12 @@ func sendResize(execStream runnerv1.RunnerService_ExecClient, cols, rows uint32)
 	return execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Resize{Resize: &runnerv1.ExecResize{Cols: cols, Rows: rows}}})
 }
 
-func writeExit(ctx context.Context, conn *websocket.Conn, code int32, reason string) error {
+func writeExit(ctx context.Context, conn *terminalConn, code int32, reason string) error {
 	payload, err := json.Marshal(exitFrame{Type: "exit", Code: code, Reason: reason})
 	if err != nil {
 		return err
 	}
-	return conn.Write(ctx, websocket.MessageText, payload)
+	return conn.write(ctx, websocket.MessageText, payload)
 }
 
 func exitReason(reason runnerv1.ExecExitReason) string {
@@ -386,9 +473,9 @@ func exitReason(reason runnerv1.ExecExitReason) string {
 	}
 }
 
-func closeWithError(ctx context.Context, conn *websocket.Conn, code websocket.StatusCode, reason string) error {
+func closeWithError(ctx context.Context, conn *terminalConn, code websocket.StatusCode, reason string) error {
 	_ = writeExit(ctx, conn, 1, "error")
-	_ = conn.Close(code, reason)
+	_ = conn.close(code, reason)
 	return errors.New(reason)
 }
 

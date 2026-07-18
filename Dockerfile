@@ -15,8 +15,7 @@ RUN buf generate buf.build/agynio/api \
     --path agynio/api/terminal_proxy/v1 \
     --path agynio/api/runner/v1 \
     --path agynio/api/runners/v1 \
-    --path agynio/api/agents/v1 \
-    --path agynio/api/ziti_management/v1
+    --path agynio/api/agents/v1
 
 COPY . .
 

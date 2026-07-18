@@ -12,7 +12,6 @@ inputs:
       - agynio/api/runner/v1
       - agynio/api/runners/v1
       - agynio/api/agents/v1
-      - agynio/api/ziti_management/v1
 plugins:
   - remote: buf.build/protocolbuffers/go
     out: .gen/go

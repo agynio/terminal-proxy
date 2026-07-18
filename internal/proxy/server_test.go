@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"sync"
@@ -23,12 +24,7 @@ import (
 
 func TestIssueTicketReturnsSignedShortLivedTicket(t *testing.T) {
 	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
-	runners := &fakeRunnersClient{}
-	agents := &fakeAgentsClient{}
-	server, err := New(Config{Tickets: store, TicketTTL: 30 * time.Second, WebSocketURL: "ws://proxy/terminal", Runners: runners, Agents: agents, RunnerDialer: &fakeRunnerDialer{}, TouchInterval: time.Second})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
+	server := newTestServer(t, store, &fakeRunnersClient{}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 	identityID := uuid.NewString()
 	workloadID := uuid.NewString()
 	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
@@ -68,14 +64,13 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 		Status:     runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
 		OwnerKind:  runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX,
 		OwnerId:    sandboxID,
-		Containers: []*runnersv1.Container{{Name: "main", ContainerId: "workload-" + workloadID, Status: runnersv1.ContainerStatus_CONTAINER_STATUS_RUNNING}},
+		InstanceId: stringPtr("workload-" + workloadID),
+		Containers: []*runnersv1.Container{
+			{Name: "main", ContainerId: "container-runtime-id", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN, Status: runnersv1.ContainerStatus_CONTAINER_STATUS_RUNNING},
+		},
 	}}
 	agents := &fakeAgentsClient{}
-	dialer := &fakeRunnerDialer{runner: runner}
-	server, err := New(Config{Tickets: store, TicketTTL: 30 * time.Second, WebSocketURL: "ws://proxy/terminal", Runners: runners, Agents: agents, RunnerDialer: dialer, TouchInterval: time.Hour})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
+	server := newTestServer(t, store, runners, agents, &fakeRunnerDialer{runner: runner})
 	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{
 		IdentityId:    uuid.NewString(),
 		WorkloadId:    workloadID,
@@ -85,17 +80,9 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
-	httpServer := httptest.NewServer(server)
-	defer httpServer.Close()
-	wsURL := "ws" + httpServer.URL[len("http"):] + "/terminal?ticket=" + issued.GetTicket()
-	conn, _, err := websocket.Dial(context.Background(), wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
+	conn := dialTestTerminal(t, server, issued.GetTicket())
 	defer conn.CloseNow()
-	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"cols":120,"rows":40}`)); err != nil {
-		t.Fatalf("write handshake: %v", err)
-	}
+	writeHandshake(t, conn, 120, 40)
 	start := runner.recv(t)
 	if start.GetStart() == nil {
 		t.Fatalf("expected start, got %v", start)
@@ -148,6 +135,38 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 	eventually(t, func() bool { return agents.lastSessionSandboxID() == sandboxID })
 }
 
+func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {
+	workloadID := uuid.NewString()
+	workload := &runnersv1.Workload{
+		Meta: &runnersv1.EntityMeta{Id: workloadID},
+		Containers: []*runnersv1.Container{
+			{Name: "main", ContainerId: "runtime-main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN},
+			{Name: "sidecar", ContainerId: "runtime-sidecar", Role: runnersv1.ContainerRole_CONTAINER_ROLE_SIDECAR},
+		},
+	}
+	targetID, err := execTargetID(workload, "main")
+	if err != nil {
+		t.Fatalf("exec target: %v", err)
+	}
+	if targetID != "workload-"+workloadID {
+		t.Fatalf("expected pod target, got %q", targetID)
+	}
+	if _, err := execTargetID(workload, "sidecar"); err == nil {
+		t.Fatal("expected sidecar target to be rejected until Runner.Exec supports container selection")
+	}
+}
+
+func TestWebSocketLivenessStopsOnMissedPong(t *testing.T) {
+	pinger := &fakePinger{err: errors.New("pong timeout")}
+	err := websocketLiveness(context.Background(), pinger, time.Millisecond, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected liveness error")
+	}
+	if pinger.count() != 1 {
+		t.Fatalf("expected one ping, got %d", pinger.count())
+	}
+}
+
 func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
 	workloadID := uuid.NewString()
@@ -158,27 +177,17 @@ func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 		Status:     runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
 		OwnerKind:  runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
 		OwnerId:    uuid.NewString(),
-		Containers: []*runnersv1.Container{{Name: "main", ContainerId: "workload-" + workloadID}},
+		Containers: []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
 	}}
 	agents := &fakeAgentsClient{}
-	server, err := New(Config{Tickets: store, TicketTTL: 30 * time.Second, WebSocketURL: "ws://proxy/terminal", Runners: runners, Agents: agents, RunnerDialer: &fakeRunnerDialer{runner: runner}, TouchInterval: time.Millisecond})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
+	server := newTestServer(t, store, runners, agents, &fakeRunnerDialer{runner: runner})
 	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
-	httpServer := httptest.NewServer(server)
-	defer httpServer.Close()
-	conn, _, err := websocket.Dial(context.Background(), "ws"+httpServer.URL[len("http"):]+"/terminal?ticket="+issued.GetTicket(), nil)
-	if err != nil {
-		t.Fatalf("dial websocket: %v", err)
-	}
+	conn := dialTestTerminal(t, server, issued.GetTicket())
 	defer conn.CloseNow()
-	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"cols":80,"rows":24}`)); err != nil {
-		t.Fatalf("write handshake: %v", err)
-	}
+	writeHandshake(t, conn, 80, 24)
 	_ = runner.recv(t)
 	_ = runner.recv(t)
 	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Exit{Exit: &runnerv1.ExecExit{Reason: runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED}}}); err != nil {
@@ -191,6 +200,47 @@ func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	}
 	if agents.lastSessionSandboxID() != "" {
 		t.Fatalf("expected no sandbox update, got %q", agents.lastSessionSandboxID())
+	}
+}
+
+func newTestServer(t *testing.T, store *ticket.Store, runners *fakeRunnersClient, agents *fakeAgentsClient, dialer *fakeRunnerDialer) *Server {
+	t.Helper()
+	server, err := New(Config{
+		Tickets:               store,
+		TicketTTL:             30 * time.Second,
+		WebSocketURL:          "ws://proxy/terminal",
+		Runners:               runners,
+		Agents:                agents,
+		RunnerDialer:          dialer,
+		TouchInterval:         time.Hour,
+		WebSocketPingInterval: time.Hour,
+		WebSocketPingTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	return server
+}
+
+func dialTestTerminal(t *testing.T, server *Server, ticket string) *websocket.Conn {
+	t.Helper()
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+	conn, _, err := websocket.Dial(context.Background(), "ws"+httpServer.URL[len("http"):]+"/terminal?ticket="+ticket, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	return conn
+}
+
+func writeHandshake(t *testing.T, conn *websocket.Conn, cols, rows uint32) {
+	t.Helper()
+	payload, err := json.Marshal(handshake{Cols: cols, Rows: rows})
+	if err != nil {
+		t.Fatalf("marshal handshake: %v", err)
+	}
+	if err := conn.Write(context.Background(), websocket.MessageText, payload); err != nil {
+		t.Fatalf("write handshake: %v", err)
 	}
 }
 
@@ -249,6 +299,8 @@ type fakeRunnerClient struct {
 	once sync.Once
 	in   chan *runnerv1.ExecRequest
 	out  chan *runnerv1.ExecResponse
+	mu   sync.Mutex
+	ctx  context.Context
 }
 
 func (f *fakeRunnerClient) init() {
@@ -258,9 +310,12 @@ func (f *fakeRunnerClient) init() {
 	})
 }
 
-func (f *fakeRunnerClient) Exec(context.Context, ...grpc.CallOption) (runnerv1.RunnerService_ExecClient, error) {
+func (f *fakeRunnerClient) Exec(ctx context.Context, opts ...grpc.CallOption) (runnerv1.RunnerService_ExecClient, error) {
 	f.init()
-	return &fakeExecClient{ctx: context.Background(), in: f.in, out: f.out}, nil
+	f.mu.Lock()
+	f.ctx = ctx
+	f.mu.Unlock()
+	return &fakeExecClient{ctx: ctx, in: f.in, out: f.out}, nil
 }
 
 func (f *fakeRunnerClient) recv(t *testing.T) *runnerv1.ExecRequest {
@@ -279,6 +334,21 @@ func (f *fakeRunnerClient) send(resp *runnerv1.ExecResponse) error {
 	f.init()
 	f.out <- resp
 	return nil
+}
+
+func (f *fakeRunnerClient) contextDone() bool {
+	f.mu.Lock()
+	ctx := f.ctx
+	f.mu.Unlock()
+	if ctx == nil {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 type fakeExecClient struct {
@@ -305,6 +375,25 @@ func (f *fakeExecClient) CloseSend() error { return nil }
 
 func (f *fakeExecClient) Context() context.Context { return f.ctx }
 
+type fakePinger struct {
+	mu    sync.Mutex
+	pings int
+	err   error
+}
+
+func (f *fakePinger) Ping(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pings++
+	return f.err
+}
+
+func (f *fakePinger) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pings
+}
+
 func eventually(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -316,5 +405,7 @@ func eventually(t *testing.T, fn func() bool) {
 	}
 	t.Fatal("condition not met")
 }
+
+func stringPtr(value string) *string { return &value }
 
 var _ = timestamppb.Now
