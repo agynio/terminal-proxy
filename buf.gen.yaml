@@ -1,0 +1,25 @@
+version: v2
+
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/agynio/terminal-proxy/.gen/go
+inputs:
+  - module: buf.build/agynio/api
+    paths:
+      - agynio/api/terminal_proxy/v1
+      - agynio/api/runner/v1
+      - agynio/api/runners/v1
+      - agynio/api/agents/v1
+      - agynio/api/ziti_management/v1
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+  - remote: buf.build/grpc/go
+    out: .gen/go
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
