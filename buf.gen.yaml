@@ -12,6 +12,7 @@ inputs:
       - agynio/api/runner/v1
       - agynio/api/runners/v1
       - agynio/api/agents/v1
+      - agynio/api/authorization/v1
 plugins:
   - remote: buf.build/protocolbuffers/go
     out: .gen/go

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	agentsv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/agents/v1"
+	authorizationv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/authorization/v1"
 	runnerv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runner/v1"
 	runnersv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runners/v1"
 	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
@@ -27,24 +28,42 @@ import (
 )
 
 const (
-	defaultShell       = "exec ${SHELL:-sh} -l"
-	workloadNamePrefix = "workload-"
+	defaultShell         = "exec ${SHELL:-sh} -l"
+	workloadNamePrefix   = "workload-"
+	workloadListPageSize = 1000
+
+	terminalIdentityObjectPrefix = "identity:"
+	terminalSandboxObjectPrefix  = "sandbox:"
+	terminalAgentObjectPrefix    = "agent:"
+
+	terminalSandboxConnectRelation  = "can_connect"
+	terminalAgentEditConfigRelation = "can_edit_config"
 )
 
 type RunnersClient interface {
-	GetWorkload(context.Context, *runnersv1.GetWorkloadRequest, ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error)
+	ListWorkloads(context.Context, *runnersv1.ListWorkloadsRequest, ...grpc.CallOption) (*runnersv1.ListWorkloadsResponse, error)
 	TouchWorkload(context.Context, *runnersv1.TouchWorkloadRequest, ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error)
+}
+
+type AuthorizationClient interface {
+	Check(context.Context, *authorizationv1.CheckRequest, ...grpc.CallOption) (*authorizationv1.CheckResponse, error)
 }
 
 type AgentsClient interface {
 	UpdateSandboxLastSession(context.Context, *agentsv1.UpdateSandboxLastSessionRequest, ...grpc.CallOption) (*agentsv1.UpdateSandboxLastSessionResponse, error)
 }
 
+type TicketStore interface {
+	Issue(string, string, string, *terminalproxyv1.TerminalCommand, time.Duration) (string, time.Time, error)
+	Consume(string) (*ticket.Claims, error)
+}
+
 type Config struct {
-	Tickets               *ticket.Store
+	Tickets               TicketStore
 	TicketTTL             time.Duration
 	WebSocketURL          string
 	Runners               RunnersClient
+	Authorization         AuthorizationClient
 	Agents                AgentsClient
 	RunnerDialer          runnerdial.RunnerDialer
 	TouchInterval         time.Duration
@@ -54,10 +73,11 @@ type Config struct {
 
 type Server struct {
 	terminalproxyv1.UnimplementedTerminalProxyServiceServer
-	tickets               *ticket.Store
+	tickets               TicketStore
 	ticketTTL             time.Duration
 	webSocketURL          string
 	runners               RunnersClient
+	authorization         AuthorizationClient
 	agents                AgentsClient
 	runnerDialer          runnerdial.RunnerDialer
 	touchInterval         time.Duration
@@ -104,6 +124,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Runners == nil {
 		return nil, errors.New("runners client missing")
 	}
+	if cfg.Authorization == nil {
+		return nil, errors.New("authorization client missing")
+	}
 	if cfg.Agents == nil {
 		return nil, errors.New("agents client missing")
 	}
@@ -124,6 +147,7 @@ func New(cfg Config) (*Server, error) {
 		ticketTTL:             cfg.TicketTTL,
 		webSocketURL:          strings.TrimSpace(cfg.WebSocketURL),
 		runners:               cfg.Runners,
+		authorization:         cfg.Authorization,
 		agents:                cfg.Agents,
 		runnerDialer:          cfg.RunnerDialer,
 		touchInterval:         cfg.TouchInterval,
@@ -136,7 +160,18 @@ func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTick
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request required")
 	}
-	token, expiresAt, err := s.tickets.Issue(req.GetIdentityId(), req.GetWorkloadId(), req.GetContainerName(), req.GetCommand(), s.ticketTTL)
+	identityID, workloadID, containerName, err := validateIssueTicketRequest(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	workload, err := s.loadWorkload(ctx, workloadID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authorizeTerminal(ctx, identityID, workload); err != nil {
+		return nil, err
+	}
+	token, expiresAt, err := s.tickets.Issue(identityID, workloadID, containerName, req.GetCommand(), s.ticketTTL)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -223,15 +258,86 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 }
 
 func (s *Server) loadWorkload(ctx context.Context, workloadID string) (*runnersv1.Workload, error) {
-	resp, err := s.runners.GetWorkload(ctx, &runnersv1.GetWorkloadRequest{Id: workloadID})
+	pageToken := ""
+	for {
+		resp, err := s.runners.ListWorkloads(ctx, &runnersv1.ListWorkloadsRequest{PageSize: workloadListPageSize, PageToken: pageToken})
+		if err != nil {
+			return nil, err
+		}
+		for _, workload := range resp.GetWorkloads() {
+			if workload.GetMeta().GetId() == workloadID {
+				return workload, nil
+			}
+		}
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			return nil, status.Error(codes.NotFound, "workload not found")
+		}
+	}
+}
+
+func validateIssueTicketRequest(req *terminalproxyv1.IssueTicketRequest) (string, string, string, error) {
+	identityID, err := parseUUID(req.GetIdentityId(), "identity_id")
 	if err != nil {
-		return nil, fmt.Errorf("get workload %s: %w", workloadID, err)
+		return "", "", "", err
 	}
-	workload := resp.GetWorkload()
-	if workload == nil || workload.GetMeta() == nil || workload.GetMeta().GetId() == "" {
-		return nil, errors.New("workload missing")
+	workloadID, err := parseUUID(req.GetWorkloadId(), "workload_id")
+	if err != nil {
+		return "", "", "", err
 	}
-	return workload, nil
+	containerName := strings.TrimSpace(req.GetContainerName())
+	if containerName == "" {
+		return "", "", "", errors.New("container_name is required")
+	}
+	return identityID, workloadID, containerName, nil
+}
+
+func parseUUID(value, field string) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return "", fmt.Errorf("%s must be a UUID", field)
+	}
+	return parsed.String(), nil
+}
+
+func (s *Server) authorizeTerminal(ctx context.Context, identityID string, workload *runnersv1.Workload) error {
+	tuple, err := terminalAuthorizationTuple(identityID, workload)
+	if err != nil {
+		return err
+	}
+	resp, err := s.authorization.Check(ctx, &authorizationv1.CheckRequest{TupleKey: tuple})
+	if err != nil {
+		return err
+	}
+	if resp == nil || !resp.GetAllowed() {
+		return status.Error(codes.PermissionDenied, "terminal access denied")
+	}
+	return nil
+}
+
+func terminalAuthorizationTuple(identityID string, workload *runnersv1.Workload) (*authorizationv1.TupleKey, error) {
+	if workload == nil || workload.GetMeta().GetId() == "" {
+		return nil, status.Error(codes.FailedPrecondition, "workload missing")
+	}
+	user := terminalIdentityObjectPrefix + strings.TrimSpace(identityID)
+	switch workload.GetOwnerKind() {
+	case runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX:
+		ownerID, err := parseUUID(workload.GetOwnerId(), "owner_id")
+		if err != nil {
+			return nil, status.Error(codes.PermissionDenied, "terminal access denied")
+		}
+		return &authorizationv1.TupleKey{User: user, Relation: terminalSandboxConnectRelation, Object: terminalSandboxObjectPrefix + ownerID}, nil
+	case runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE:
+		agentID, err := parseUUID(workload.GetAgentClassId(), "agent_class_id")
+		if err != nil {
+			return nil, status.Error(codes.PermissionDenied, "terminal access denied")
+		}
+		return &authorizationv1.TupleKey{User: user, Relation: terminalAgentEditConfigRelation, Object: terminalAgentObjectPrefix + agentID}, nil
+	case runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_UNSPECIFIED:
+		return nil, status.Error(codes.PermissionDenied, "terminal access denied")
+	default:
+		return nil, status.Error(codes.PermissionDenied, "terminal access denied")
+	}
 }
 
 func (s *Server) touchSandboxWorkload(ctx context.Context, workloadID string) {

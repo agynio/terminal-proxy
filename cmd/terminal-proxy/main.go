@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	agentsv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/agents/v1"
+	authorizationv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/authorization/v1"
 	runnerv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runner/v1"
 	runnersv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runners/v1"
 	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
@@ -55,6 +56,11 @@ func run() error {
 		return fmt.Errorf("dial agents: %w", err)
 	}
 	defer closeConn(agentsConn)
+	authorizationConn, err := grpc.NewClient(cfg.AuthorizationAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("dial authorization: %w", err)
+	}
+	defer closeConn(authorizationConn)
 
 	var (
 		dialer      runnerdial.RunnerDialer
@@ -82,6 +88,7 @@ func run() error {
 		TicketTTL:             cfg.TicketTTL,
 		WebSocketURL:          cfg.PublicWebSocketURL,
 		Runners:               runnersv1.NewRunnersServiceClient(runnersConn),
+		Authorization:         authorizationv1.NewAuthorizationServiceClient(authorizationConn),
 		Agents:                agentsv1.NewAgentsServiceClient(agentsConn),
 		RunnerDialer:          dialer,
 		TouchInterval:         cfg.TouchInterval,
