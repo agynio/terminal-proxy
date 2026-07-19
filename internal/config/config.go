@@ -20,6 +20,7 @@ type Config struct {
 	WebSocketPingTimeout  time.Duration
 	RunnersAddress        string
 	AgentsAddress         string
+	AuthorizationAddress  string
 	RunnerAddress         string
 	ZitiEnabled           bool
 	ZitiIdentityFile      string
@@ -36,6 +37,7 @@ func FromEnv() (Config, error) {
 		WebSocketPingTimeout:  30 * time.Second,
 		RunnersAddress:        envDefault("RUNNERS_ADDRESS", "runners:50051"),
 		AgentsAddress:         envDefault("AGENTS_ADDRESS", "agents:50051"),
+		AuthorizationAddress:  envDefault("AUTHORIZATION_ADDRESS", "authorization:50051"),
 		RunnerAddress:         envDefault("RUNNER_ADDRESS", "k8s-runner:50051"),
 	}
 	key, err := signingKeyFromEnv(os.Getenv("TERMINAL_PROXY_TICKET_SIGNING_KEY"))

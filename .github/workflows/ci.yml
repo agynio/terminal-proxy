@@ -33,6 +33,7 @@ jobs:
             --path agynio/api/runner/v1 \
             --path agynio/api/runners/v1 \
             --path agynio/api/agents/v1 \
+            --path agynio/api/authorization/v1
 
       - name: Run tests
         run: CGO_ENABLED=0 go test ./...

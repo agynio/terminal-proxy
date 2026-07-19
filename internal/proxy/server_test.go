@@ -11,6 +11,7 @@ import (
 	"time"
 
 	agentsv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/agents/v1"
+	authorizationv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/authorization/v1"
 	runnerv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runner/v1"
 	runnersv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runners/v1"
 	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
@@ -18,19 +19,23 @@ import (
 	"github.com/agynio/terminal-proxy/internal/ticket"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"nhooyr.io/websocket"
 )
 
 func TestIssueTicketReturnsSignedShortLivedTicket(t *testing.T) {
 	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
-	server := newTestServer(t, store, &fakeRunnersClient{}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 	identityID := uuid.NewString()
 	workloadID := uuid.NewString()
+	sandboxID := uuid.NewString()
+	authorization := &fakeAuthorizationClient{allowed: true}
+	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, sandboxID)}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
 	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
+	assertAuthorizationTuple(t, authorization.lastRequest(), "identity:"+identityID, "can_connect", "sandbox:"+sandboxID)
 	if resp.GetTicket() == "" {
 		t.Fatal("expected ticket")
 	}
@@ -70,7 +75,7 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 		},
 	}}
 	agents := &fakeAgentsClient{}
-	server := newTestServer(t, store, runners, agents, &fakeRunnerDialer{runner: runner})
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, agents, &fakeRunnerDialer{runner: runner})
 	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{
 		IdentityId:    uuid.NewString(),
 		WorkloadId:    workloadID,
@@ -167,20 +172,150 @@ func TestWebSocketLivenessStopsOnMissedPong(t *testing.T) {
 	}
 }
 
+func TestIssueTicketAuthorizesSandboxWorkload(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	identityID := uuid.NewString()
+	workloadID := uuid.NewString()
+	sandboxID := uuid.NewString()
+	authorization := &fakeAuthorizationClient{allowed: true}
+	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, sandboxID)}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+	if resp.GetTicket() == "" {
+		t.Fatal("expected ticket")
+	}
+	if store.issueCount() != 1 {
+		t.Fatalf("expected one ticket issue, got %d", store.issueCount())
+	}
+	assertAuthorizationTuple(t, authorization.lastRequest(), "identity:"+identityID, "can_connect", "sandbox:"+sandboxID)
+}
+
+func TestIssueTicketDeniesSandboxWorkload(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	workloadID := uuid.NewString()
+	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}, &fakeAuthorizationClient{}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	assertCode(t, err, codes.PermissionDenied)
+	if store.issueCount() != 0 {
+		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
+	}
+}
+
+func TestIssueTicketAuthorizesAgentWorkload(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	identityID := uuid.NewString()
+	workloadID := uuid.NewString()
+	agentID := uuid.NewString()
+	authorization := &fakeAuthorizationClient{allowed: true}
+	server := newTestServer(t, store, &fakeRunnersClient{workload: agentWorkload(workloadID, agentID)}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+	if resp.GetTicket() == "" {
+		t.Fatal("expected ticket")
+	}
+	assertAuthorizationTuple(t, authorization.lastRequest(), "identity:"+identityID, "can_edit_config", "agent:"+agentID)
+}
+
+func TestIssueTicketDeniesAgentWorkload(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	workloadID := uuid.NewString()
+	server := newTestServer(t, store, &fakeRunnersClient{workload: agentWorkload(workloadID, uuid.NewString())}, &fakeAuthorizationClient{}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	assertCode(t, err, codes.PermissionDenied)
+	if store.issueCount() != 0 {
+		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
+	}
+}
+
+func TestIssueTicketDeniesUnsupportedOwnerKind(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	workloadID := uuid.NewString()
+	authorization := &fakeAuthorizationClient{allowed: true}
+	server := newTestServer(t, store, &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:      &runnersv1.EntityMeta{Id: workloadID},
+		OwnerKind: runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_UNSPECIFIED,
+	}}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	assertCode(t, err, codes.PermissionDenied)
+	if authorization.checkCount() != 0 {
+		t.Fatalf("expected no authorization call, got %d", authorization.checkCount())
+	}
+	if store.issueCount() != 0 {
+		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
+	}
+}
+
+func TestIssueTicketDeniesMalformedOwner(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	workloadID := uuid.NewString()
+	authorization := &fakeAuthorizationClient{allowed: true}
+	server := newTestServer(t, store, &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:      &runnersv1.EntityMeta{Id: workloadID},
+		OwnerKind: runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX,
+		OwnerId:   "not-a-uuid",
+	}}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	assertCode(t, err, codes.PermissionDenied)
+	if authorization.checkCount() != 0 {
+		t.Fatalf("expected no authorization call, got %d", authorization.checkCount())
+	}
+	if store.issueCount() != 0 {
+		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
+	}
+}
+
+func TestIssueTicketPropagatesAuthorizationError(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	workloadID := uuid.NewString()
+	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}, &fakeAuthorizationClient{err: status.Error(codes.Unavailable, "authz unavailable")}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	assertCode(t, err, codes.Unavailable)
+	if store.issueCount() != 0 {
+		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
+	}
+}
+
+func TestIssueTicketDoesNotAuthorizeOrIssueForInvalidRequest(t *testing.T) {
+	store := &countingTicketStore{store: ticket.NewStore([]byte("01234567890123456789012345678901"))}
+	authorization := &fakeAuthorizationClient{allowed: true}
+	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(uuid.NewString(), uuid.NewString())}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: "not-a-uuid", WorkloadId: uuid.NewString(), ContainerName: "main"})
+	assertCode(t, err, codes.InvalidArgument)
+	if authorization.checkCount() != 0 {
+		t.Fatalf("expected no authorization call, got %d", authorization.checkCount())
+	}
+	if store.issueCount() != 0 {
+		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
+	}
+}
+
 func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
 	workloadID := uuid.NewString()
 	runner := &fakeRunnerClient{}
 	runners := &fakeRunnersClient{workload: &runnersv1.Workload{
-		Meta:       &runnersv1.EntityMeta{Id: workloadID},
-		RunnerId:   uuid.NewString(),
-		Status:     runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
-		OwnerKind:  runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
-		OwnerId:    uuid.NewString(),
-		Containers: []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
+		Meta:         &runnersv1.EntityMeta{Id: workloadID},
+		RunnerId:     uuid.NewString(),
+		Status:       runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
+		OwnerKind:    runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
+		OwnerId:      uuid.NewString(),
+		AgentClassId: stringPtr(uuid.NewString()),
+		Containers:   []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
 	}}
 	agents := &fakeAgentsClient{}
-	server := newTestServer(t, store, runners, agents, &fakeRunnerDialer{runner: runner})
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, agents, &fakeRunnerDialer{runner: runner})
 	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
@@ -203,13 +338,14 @@ func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	}
 }
 
-func newTestServer(t *testing.T, store *ticket.Store, runners *fakeRunnersClient, agents *fakeAgentsClient, dialer *fakeRunnerDialer) *Server {
+func newTestServer(t *testing.T, store TicketStore, runners *fakeRunnersClient, authorization *fakeAuthorizationClient, agents *fakeAgentsClient, dialer *fakeRunnerDialer) *Server {
 	t.Helper()
 	server, err := New(Config{
 		Tickets:               store,
 		TicketTTL:             30 * time.Second,
 		WebSocketURL:          "ws://proxy/terminal",
 		Runners:               runners,
+		Authorization:         authorization,
 		Agents:                agents,
 		RunnerDialer:          dialer,
 		TouchInterval:         time.Hour,
@@ -246,12 +382,19 @@ func writeHandshake(t *testing.T, conn *websocket.Conn, cols, rows uint32) {
 
 type fakeRunnersClient struct {
 	workload *runnersv1.Workload
+	listErr  error
 	mu       sync.Mutex
 	touches  []string
 }
 
-func (f *fakeRunnersClient) GetWorkload(context.Context, *runnersv1.GetWorkloadRequest, ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error) {
-	return &runnersv1.GetWorkloadResponse{Workload: f.workload}, nil
+func (f *fakeRunnersClient) ListWorkloads(context.Context, *runnersv1.ListWorkloadsRequest, ...grpc.CallOption) (*runnersv1.ListWorkloadsResponse, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.workload == nil {
+		return &runnersv1.ListWorkloadsResponse{}, nil
+	}
+	return &runnersv1.ListWorkloadsResponse{Workloads: []*runnersv1.Workload{f.workload}}, nil
 }
 
 func (f *fakeRunnersClient) TouchWorkload(_ context.Context, req *runnersv1.TouchWorkloadRequest, _ ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error) {
@@ -265,6 +408,61 @@ func (f *fakeRunnersClient) touchCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.touches)
+}
+
+type fakeAuthorizationClient struct {
+	allowed bool
+	err     error
+	mu      sync.Mutex
+	checks  []*authorizationv1.CheckRequest
+}
+
+func (f *fakeAuthorizationClient) Check(_ context.Context, req *authorizationv1.CheckRequest, _ ...grpc.CallOption) (*authorizationv1.CheckResponse, error) {
+	f.mu.Lock()
+	f.checks = append(f.checks, req)
+	f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &authorizationv1.CheckResponse{Allowed: f.allowed}, nil
+}
+
+func (f *fakeAuthorizationClient) lastRequest() *authorizationv1.CheckRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.checks) == 0 {
+		return nil
+	}
+	return f.checks[len(f.checks)-1]
+}
+
+func (f *fakeAuthorizationClient) checkCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.checks)
+}
+
+type countingTicketStore struct {
+	store *ticket.Store
+	mu    sync.Mutex
+	count int
+}
+
+func (s *countingTicketStore) Issue(identityID, workloadID, containerName string, command *terminalproxyv1.TerminalCommand, ttl time.Duration) (string, time.Time, error) {
+	s.mu.Lock()
+	s.count++
+	s.mu.Unlock()
+	return s.store.Issue(identityID, workloadID, containerName, command, ttl)
+}
+
+func (s *countingTicketStore) Consume(raw string) (*ticket.Claims, error) {
+	return s.store.Consume(raw)
+}
+
+func (s *countingTicketStore) issueCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
 }
 
 type fakeAgentsClient struct {
@@ -406,6 +604,39 @@ func eventually(t *testing.T, fn func() bool) {
 	t.Fatal("condition not met")
 }
 
-func stringPtr(value string) *string { return &value }
+func sandboxWorkload(workloadID, sandboxID string) *runnersv1.Workload {
+	return &runnersv1.Workload{
+		Meta:      &runnersv1.EntityMeta{Id: workloadID},
+		OwnerKind: runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX,
+		OwnerId:   sandboxID,
+	}
+}
 
-var _ = timestamppb.Now
+func agentWorkload(workloadID, agentID string) *runnersv1.Workload {
+	return &runnersv1.Workload{
+		Meta:         &runnersv1.EntityMeta{Id: workloadID},
+		OwnerKind:    runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
+		OwnerId:      uuid.NewString(),
+		AgentClassId: stringPtr(agentID),
+	}
+}
+
+func assertAuthorizationTuple(t *testing.T, req *authorizationv1.CheckRequest, user, relation, object string) {
+	t.Helper()
+	if req == nil || req.GetTupleKey() == nil {
+		t.Fatal("expected authorization check")
+	}
+	tuple := req.GetTupleKey()
+	if tuple.GetUser() != user || tuple.GetRelation() != relation || tuple.GetObject() != object {
+		t.Fatalf("unexpected tuple user=%q relation=%q object=%q", tuple.GetUser(), tuple.GetRelation(), tuple.GetObject())
+	}
+}
+
+func assertCode(t *testing.T, err error, code codes.Code) {
+	t.Helper()
+	if status.Code(err) != code {
+		t.Fatalf("expected code %s, got %s: %v", code, status.Code(err), err)
+	}
+}
+
+func stringPtr(value string) *string { return &value }
