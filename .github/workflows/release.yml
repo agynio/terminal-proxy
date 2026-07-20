@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/agynio/terminal-proxy
+
+jobs:
+  guard:
+    name: Verify release tag
+    uses: agynio/.github/.github/workflows/release-tag-guard.yml@main
+    permissions:
+      contents: read
+
+  image:
+    name: Build and push container image
+    runs-on: ubuntu-latest
+    needs: guard
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=terminal-proxy
+          cache-to: type=gha,scope=terminal-proxy,mode=max
+
+      - name: Verify multi-arch manifest
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          INSPECT="$(docker buildx imagetools inspect "$IMAGE_NAME:$TAG" --raw)"
+          FOUND="$(echo "$INSPECT" | jq -r '[.manifests[].platform.architecture] | sort | join(",")')"
+          MISSING=()
+          for ARCH in amd64 arm64; do
+            if ! echo "$FOUND" | grep -q "$ARCH"; then
+              MISSING+=("linux/$ARCH")
+            fi
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::error::Missing architectures in $IMAGE_NAME:$TAG: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "Manifest $IMAGE_NAME:$TAG includes linux/amd64 and linux/arm64"
