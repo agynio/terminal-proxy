@@ -31,6 +31,8 @@ const (
 	defaultShell       = "exec ${SHELL:-sh} -l"
 	workloadNamePrefix = "workload-"
 
+	cancelExecutionTimeout = 10 * time.Second
+
 	terminalIdentityObjectPrefix = "identity:"
 	terminalSandboxObjectPrefix  = "sandbox:"
 	terminalAgentObjectPrefix    = "agent:"
@@ -87,6 +89,38 @@ type Server struct {
 type terminalConn struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
+}
+
+// execState tracks what the proxy learned from the exec stream: the runner's
+// execution id (needed to release the PTY) and whether the runner already ended
+// the execution itself.
+type execState struct {
+	mu          sync.Mutex
+	executionID string
+	finished    bool
+}
+
+func (e *execState) setExecutionID(executionID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.executionID = strings.TrimSpace(executionID)
+}
+
+func (e *execState) markFinished() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.finished = true
+}
+
+// pendingExecutionID returns the execution id that still holds a PTY, or an
+// empty string when the runner already ended the execution.
+func (e *execState) pendingExecutionID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finished {
+		return ""
+	}
+	return e.executionID
 }
 
 type websocketPinger interface {
@@ -243,12 +277,16 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 		go s.touchSandboxWorkload(sessionCtx, workload.GetMeta().GetId())
 		defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
 	}
+	exec := &execState{}
 	errCh := make(chan error, 3)
 	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream) }()
-	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream) }()
+	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec) }()
 	go func() { errCh <- websocketLiveness(sessionCtx, conn, s.webSocketPingInterval, s.webSocketPingTimeout) }()
 	err = <-errCh
 	cancel()
+	// The session ended before the runner reported an exit — the client is gone
+	// (missed pongs, dropped socket, write failure) and the PTY is still held.
+	s.cancelExecution(runnerClient, exec.pendingExecutionID())
 	_ = conn.close(websocket.StatusNormalClosure, "terminal session ended")
 	if err == nil || errors.Is(err, context.Canceled) || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
 		return nil
@@ -355,6 +393,20 @@ func (s *Server) touchWorkload(ctx context.Context, workloadID string) {
 	}
 	if _, err := s.runners.TouchWorkload(ctx, &runnersv1.TouchWorkloadRequest{Id: workloadID}); err != nil && ctx.Err() == nil {
 		log.Printf("touch workload %s: %v", workloadID, err)
+	}
+}
+
+// cancelExecution releases the PTY the runner still holds for a session that
+// ended abnormally. The session context is already cancelled by this point, so
+// the call runs on its own bounded context.
+func (s *Server) cancelExecution(runnerClient runnerdial.RunnerClient, executionID string) {
+	if strings.TrimSpace(executionID) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cancelExecutionTimeout)
+	defer cancel()
+	if _, err := runnerClient.CancelExecution(ctx, &runnerv1.CancelExecutionRequest{ExecutionId: executionID}); err != nil {
+		log.Printf("cancel execution %s: %v", executionID, err)
 	}
 }
 
@@ -476,10 +528,11 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
-func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient) error {
+func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState) error {
 	for {
 		resp, err := execStream.Recv()
 		if errors.Is(err, io.EOF) {
+			exec.markFinished()
 			return conn.close(websocket.StatusNormalClosure, "exec complete")
 		}
 		if err != nil {
@@ -487,6 +540,8 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 			return err
 		}
 		switch event := resp.GetEvent().(type) {
+		case *runnerv1.ExecResponse_Started:
+			exec.setExecutionID(event.Started.GetExecutionId())
 		case *runnerv1.ExecResponse_Stdout:
 			if err := conn.write(ctx, websocket.MessageBinary, event.Stdout.GetData()); err != nil {
 				return err
@@ -496,12 +551,14 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 				return err
 			}
 		case *runnerv1.ExecResponse_Exit:
+			exec.markFinished()
 			reason := exitReason(event.Exit.GetReason())
 			if err := writeExit(ctx, conn, event.Exit.GetExitCode(), reason); err != nil {
 				return err
 			}
 			return nil
 		case *runnerv1.ExecResponse_Error:
+			exec.markFinished()
 			_ = writeExit(ctx, conn, 1, "error")
 			return fmt.Errorf("runner exec error %s: %s", event.Error.GetCode(), event.Error.GetMessage())
 		}

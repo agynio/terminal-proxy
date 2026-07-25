@@ -138,6 +138,10 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 	}
 	eventually(t, func() bool { return runners.touchCount() >= 1 })
 	eventually(t, func() bool { return agents.lastSessionSandboxID() == sandboxID })
+	time.Sleep(20 * time.Millisecond)
+	if cancelled := runner.cancelledExecutions(); len(cancelled) != 0 {
+		t.Fatalf("expected no cancel on normal shell exit, got %v", cancelled)
+	}
 }
 
 func TestSessionResolvesRunnerWithGetWorkload(t *testing.T) {
@@ -162,6 +166,47 @@ func TestIssueTicketPropagatesWorkloadLookupError(t *testing.T) {
 
 	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: uuid.NewString(), ContainerName: "main"})
 	assertCode(t, err, codes.NotFound)
+}
+
+func TestClientDisconnectCancelsExecution(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	runner := &fakeRunnerClient{}
+	runners := &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:         &runnersv1.EntityMeta{Id: workloadID},
+		RunnerId:     uuid.NewString(),
+		Status:       runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
+		OwnerKind:    runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
+		OwnerId:      uuid.NewString(),
+		AgentClassId: stringPtr(uuid.NewString()),
+		Containers:   []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
+	}}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{runner: runner})
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+	conn := dialTestTerminal(t, server, issued.GetTicket())
+	writeHandshake(t, conn, 80, 24)
+	_ = runner.recv(t)
+	_ = runner.recv(t)
+	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Started{Started: &runnerv1.ExecStarted{ExecutionId: "execution-1"}}}); err != nil {
+		t.Fatalf("send started: %v", err)
+	}
+	// Reading output ordered after ExecStarted proves the proxy recorded the
+	// execution id before the client goes away.
+	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Stdout{Stdout: &runnerv1.ExecOutput{Data: []byte("out")}}}); err != nil {
+		t.Fatalf("send stdout: %v", err)
+	}
+	if _, _, err := conn.Read(context.Background()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	conn.CloseNow()
+
+	eventually(t, func() bool {
+		cancelled := runner.cancelledExecutions()
+		return len(cancelled) == 1 && cancelled[0] == "execution-1"
+	})
 }
 
 func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {
@@ -528,11 +573,25 @@ func (f *fakeRunnerDialer) Dial(context.Context, string) (runnerdial.RunnerClien
 func (f *fakeRunnerDialer) Close() {}
 
 type fakeRunnerClient struct {
-	once sync.Once
-	in   chan *runnerv1.ExecRequest
-	out  chan *runnerv1.ExecResponse
-	mu   sync.Mutex
-	ctx  context.Context
+	once      sync.Once
+	in        chan *runnerv1.ExecRequest
+	out       chan *runnerv1.ExecResponse
+	mu        sync.Mutex
+	ctx       context.Context
+	cancelled []string
+}
+
+func (f *fakeRunnerClient) CancelExecution(_ context.Context, req *runnerv1.CancelExecutionRequest, _ ...grpc.CallOption) (*runnerv1.CancelExecutionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelled = append(f.cancelled, req.GetExecutionId())
+	return &runnerv1.CancelExecutionResponse{}, nil
+}
+
+func (f *fakeRunnerClient) cancelledExecutions() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cancelled...)
 }
 
 func (f *fakeRunnerClient) init() {

@@ -17,6 +17,7 @@ import (
 
 type RunnerClient interface {
 	Exec(ctx context.Context, opts ...grpc.CallOption) (runnerv1.RunnerService_ExecClient, error)
+	CancelExecution(ctx context.Context, in *runnerv1.CancelExecutionRequest, opts ...grpc.CallOption) (*runnerv1.CancelExecutionResponse, error)
 }
 
 type RunnerDialer interface {
