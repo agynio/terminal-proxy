@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -207,6 +208,23 @@ func TestClientDisconnectCancelsExecution(t *testing.T) {
 		cancelled := runner.cancelledExecutions()
 		return len(cancelled) == 1 && cancelled[0] == "execution-1"
 	})
+}
+
+func TestHealthEndpointsRespondOK(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	server := newTestServer(t, store, &fakeRunnersClient{}, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+	for _, path := range []string{"/healthz", "/readyz"} {
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", path, recorder.Code, http.StatusOK)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("/nope status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
 }
 
 func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {

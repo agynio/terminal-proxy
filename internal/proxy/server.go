@@ -216,10 +216,19 @@ func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTick
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/terminal" {
+	switch r.URL.Path {
+	case "/healthz", "/readyz":
+		// The proxy holds no state and has no startup dependency: every session
+		// resolves its runner on attach, so liveness and readiness coincide.
+		w.WriteHeader(http.StatusOK)
+	case "/terminal":
+		s.serveTerminal(w, r)
+	default:
 		http.NotFound(w, r)
-		return
 	}
+}
+
+func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request) {
 	rawTicket := strings.TrimSpace(r.URL.Query().Get("ticket"))
 	if rawTicket == "" {
 		http.Error(w, "ticket required", http.StatusUnauthorized)
