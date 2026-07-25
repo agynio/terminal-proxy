@@ -2,8 +2,8 @@ apiVersion: v2
 name: terminal-proxy
 description: Helm chart for deploying the agyn Terminal Proxy service.
 type: application
-version: 0.5.11
-appVersion: 0.5.11
+version: 0.1.0
+appVersion: 0.1.0
 home: https://github.com/agynio/terminal-proxy
 sources:
   - https://github.com/agynio/terminal-proxy
