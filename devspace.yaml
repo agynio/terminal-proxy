@@ -1,0 +1,152 @@
+version: v2beta1
+
+vars:
+  TERMINAL_PROXY_NAMESPACE: platform
+  # Deployment created by the chart; override if the release name differs.
+  TERMINAL_PROXY_DEPLOYMENT: terminal-proxy
+  DEV_IMAGE: ghcr.io/agynio/devcontainer-go:1
+
+functions:
+  disable_argocd_sync: |-
+    if kubectl get application terminal-proxy -n argocd >/dev/null 2>&1; then
+      echo "Disabling ArgoCD auto-sync for terminal-proxy..."
+      kubectl patch application terminal-proxy -n argocd \
+        --type merge \
+        -p '{"spec":{"syncPolicy":{"automated":null}}}'
+      echo "ArgoCD auto-sync disabled."
+    else
+      echo "WARNING: ArgoCD Application 'terminal-proxy' not found in argocd namespace."
+    fi
+  restore_argocd_sync: &restore_argocd_sync |-
+    if kubectl get application terminal-proxy -n argocd >/dev/null 2>&1; then
+      echo "Re-enabling ArgoCD auto-sync for terminal-proxy..."
+      kubectl patch application terminal-proxy -n argocd \
+        --type merge \
+        -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+      echo "ArgoCD auto-sync restored."
+    else
+      echo "WARNING: ArgoCD Application 'terminal-proxy' not found in argocd namespace."
+    fi
+  patch_deployment: |-
+    echo "Patching terminal-proxy deployment for DevSpace..."
+    kubectl patch deployment ${TERMINAL_PROXY_DEPLOYMENT} -n ${TERMINAL_PROXY_NAMESPACE} --type strategic --patch "$(cat <<'EOF'
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsUser: 1000
+            fsGroup: 1000
+          initContainers: []
+          volumes:
+            - name: data
+              emptyDir: {}
+          containers:
+            - name: terminal-proxy
+              image: ghcr.io/agynio/devcontainer-go:1 # keep in sync with DEV_IMAGE
+              workingDir: /opt/app/data
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  elapsed=0
+                  while [ ! -f /opt/app/data/go.mod ] \
+                    || [ ! -f /opt/app/data/buf.gen.yaml ] \
+                    || [ ! -f /opt/app/data/cmd/terminal-proxy/main.go ] \
+                    || [ ! -f /opt/app/data/internal/proxy/server.go ]; do
+                    sleep 1; elapsed=$((elapsed + 1))
+                    [ "$elapsed" -ge 300 ] && { echo "ERROR: sync timeout" >&2; exit 1; }
+                  done
+                  buf generate buf.build/agynio/api \
+                    --include-imports \
+                    --path agynio/api/terminal_proxy/v1 \
+                    --path agynio/api/runner/v1 \
+                    --path agynio/api/runners/v1 \
+                    --path agynio/api/agents/v1 \
+                    --path agynio/api/authorization/v1
+                  exec go run ./cmd/terminal-proxy
+              volumeMounts:
+                - name: data
+                  mountPath: /opt/app/data
+              # go run recompiles on every restart; probes would kill the pod
+              # before the first build finishes.
+              livenessProbe: null
+              readinessProbe: null
+              startupProbe: null
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 1Gi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                runAsGroup: 1000
+                readOnlyRootFilesystem: false
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+    EOF
+    )"
+
+pipelines:
+  dev:
+    flags:
+      - name: watch
+        short: w
+        description: "Keep DevSpace running and stream logs"
+    run: |-
+      disable_argocd_sync
+      patch_deployment
+      if [ "$(get_flag "watch")" == "true" ]; then
+        start_dev --disable-pod-replace terminal-proxy
+      else
+        start_dev --disable-pod-replace terminal-proxy
+        stop_dev terminal-proxy
+      fi
+
+hooks:
+  - name: restore-argocd-auto-sync
+    events:
+      - after:dev:terminal-proxy
+    command: bash
+    args:
+      - -c
+      - *restore_argocd_sync
+
+dev:
+  terminal-proxy:
+    namespace: ${TERMINAL_PROXY_NAMESPACE}
+    labelSelector:
+      app.kubernetes.io/name: terminal-proxy
+      app.kubernetes.io/instance: terminal-proxy
+    containers:
+      terminal-proxy:
+        container: terminal-proxy
+        sync:
+          - path: ./:/opt/app/data
+            excludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+            uploadExcludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+            downloadExcludePaths:
+              - .git/
+              - .devspace/
+              - /.gen/
+              - /tmp/
+        logs:
+          enabled: true
+          lastLines: 200
+    ports:
+      - port: "8080"
+      - port: "50051"
