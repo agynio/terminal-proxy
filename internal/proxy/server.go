@@ -28,9 +28,8 @@ import (
 )
 
 const (
-	defaultShell         = "exec ${SHELL:-sh} -l"
-	workloadNamePrefix   = "workload-"
-	workloadListPageSize = 1000
+	defaultShell       = "exec ${SHELL:-sh} -l"
+	workloadNamePrefix = "workload-"
 
 	terminalIdentityObjectPrefix = "identity:"
 	terminalSandboxObjectPrefix  = "sandbox:"
@@ -41,7 +40,7 @@ const (
 )
 
 type RunnersClient interface {
-	ListWorkloads(context.Context, *runnersv1.ListWorkloadsRequest, ...grpc.CallOption) (*runnersv1.ListWorkloadsResponse, error)
+	GetWorkload(context.Context, *runnersv1.GetWorkloadRequest, ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error)
 	TouchWorkload(context.Context, *runnersv1.TouchWorkloadRequest, ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error)
 }
 
@@ -257,23 +256,19 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 	return err
 }
 
+// loadWorkload resolves the hosting runner for a workload. The call is an
+// internal, identity-less Runners lookup: terminal access is authorized by
+// authorizeTerminal, not by the Runners service.
 func (s *Server) loadWorkload(ctx context.Context, workloadID string) (*runnersv1.Workload, error) {
-	pageToken := ""
-	for {
-		resp, err := s.runners.ListWorkloads(ctx, &runnersv1.ListWorkloadsRequest{PageSize: workloadListPageSize, PageToken: pageToken})
-		if err != nil {
-			return nil, err
-		}
-		for _, workload := range resp.GetWorkloads() {
-			if workload.GetMeta().GetId() == workloadID {
-				return workload, nil
-			}
-		}
-		pageToken = resp.GetNextPageToken()
-		if pageToken == "" {
-			return nil, status.Error(codes.NotFound, "workload not found")
-		}
+	resp, err := s.runners.GetWorkload(ctx, &runnersv1.GetWorkloadRequest{Id: workloadID})
+	if err != nil {
+		return nil, err
 	}
+	workload := resp.GetWorkload()
+	if workload == nil {
+		return nil, status.Error(codes.NotFound, "workload not found")
+	}
+	return workload, nil
 }
 
 func validateIssueTicketRequest(req *terminalproxyv1.IssueTicketRequest) (string, string, string, error) {

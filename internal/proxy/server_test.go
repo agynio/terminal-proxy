@@ -140,6 +140,30 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 	eventually(t, func() bool { return agents.lastSessionSandboxID() == sandboxID })
 }
 
+func TestSessionResolvesRunnerWithGetWorkload(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	runners := &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	if _, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"}); err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+	gets := runners.getIDs()
+	if len(gets) != 1 || gets[0] != workloadID {
+		t.Fatalf("expected a single GetWorkload for %s, got %v", workloadID, gets)
+	}
+}
+
+func TestIssueTicketPropagatesWorkloadLookupError(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	runners := &fakeRunnersClient{getErr: status.Error(codes.NotFound, "workload not found")}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: uuid.NewString(), ContainerName: "main"})
+	assertCode(t, err, codes.NotFound)
+}
+
 func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {
 	workloadID := uuid.NewString()
 	workload := &runnersv1.Workload{
@@ -382,19 +406,29 @@ func writeHandshake(t *testing.T, conn *websocket.Conn, cols, rows uint32) {
 
 type fakeRunnersClient struct {
 	workload *runnersv1.Workload
-	listErr  error
+	getErr   error
 	mu       sync.Mutex
+	gets     []string
 	touches  []string
 }
 
-func (f *fakeRunnersClient) ListWorkloads(context.Context, *runnersv1.ListWorkloadsRequest, ...grpc.CallOption) (*runnersv1.ListWorkloadsResponse, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
+func (f *fakeRunnersClient) GetWorkload(_ context.Context, req *runnersv1.GetWorkloadRequest, _ ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error) {
+	f.mu.Lock()
+	f.gets = append(f.gets, req.GetId())
+	f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, f.getErr
 	}
-	if f.workload == nil {
-		return &runnersv1.ListWorkloadsResponse{}, nil
+	if f.workload == nil || f.workload.GetMeta().GetId() != req.GetId() {
+		return nil, status.Error(codes.NotFound, "workload not found")
 	}
-	return &runnersv1.ListWorkloadsResponse{Workloads: []*runnersv1.Workload{f.workload}}, nil
+	return &runnersv1.GetWorkloadResponse{Workload: f.workload}, nil
+}
+
+func (f *fakeRunnersClient) getIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.gets...)
 }
 
 func (f *fakeRunnersClient) TouchWorkload(_ context.Context, req *runnersv1.TouchWorkloadRequest, _ ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error) {
