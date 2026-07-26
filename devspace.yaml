@@ -123,7 +123,6 @@ dev:
     namespace: ${TERMINAL_PROXY_NAMESPACE}
     labelSelector:
       app.kubernetes.io/name: terminal-proxy
-      app.kubernetes.io/instance: terminal-proxy
     containers:
       terminal-proxy:
         container: terminal-proxy
