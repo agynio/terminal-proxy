@@ -74,9 +74,13 @@ functions:
               readinessProbe: null
               startupProbe: null
               resources:
+                # Requests are reservations held for the pod's whole life, but a
+                # dev container only needs its build peak briefly and then idles
+                # near 100Mi. Keeping them low lets several services run from
+                # source on one node; the limits still allow a full build.
                 requests:
-                  cpu: 500m
-                  memory: 1Gi
+                  cpu: 100m
+                  memory: 256Mi
                 limits:
                   cpu: "2"
                   memory: 4Gi
