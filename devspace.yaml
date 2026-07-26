@@ -150,6 +150,3 @@ dev:
         logs:
           enabled: true
           lastLines: 200
-    ports:
-      - port: "8080"
-      - port: "50051"
