@@ -1,5 +1,4 @@
 {{- include "terminal-proxy.configureEnv" . -}}
-{{- include "terminal-proxy.configureZitiIdentity" . -}}
 {{ include "service-base.rbac" . }}
 ---
 {{ include "service-base.serviceAccount" . }}

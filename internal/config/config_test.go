@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestFromEnvUsesDefaultServiceAddresses(t *testing.T) {
 	t.Setenv("TERMINAL_PROXY_TICKET_SIGNING_KEY", "01234567890123456789012345678901!")
@@ -33,10 +36,9 @@ func TestFromEnvUsesCustomAuthorizationAddress(t *testing.T) {
 	}
 }
 
-func TestFromEnvUsesMountedZitiIdentityFile(t *testing.T) {
+func TestFromEnvDefaultsZitiIdentityAcquisition(t *testing.T) {
 	t.Setenv("TERMINAL_PROXY_TICKET_SIGNING_KEY", "01234567890123456789012345678901!")
 	t.Setenv("ZITI_ENABLED", "true")
-	t.Setenv("ZITI_IDENTITY_FILE", "/var/run/agyn/terminal-proxy/identity.json")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -45,7 +47,48 @@ func TestFromEnvUsesMountedZitiIdentityFile(t *testing.T) {
 	if !cfg.ZitiEnabled {
 		t.Fatal("expected ziti enabled")
 	}
-	if cfg.ZitiIdentityFile != "/var/run/agyn/terminal-proxy/identity.json" {
-		t.Fatalf("unexpected ziti identity file %q", cfg.ZitiIdentityFile)
+	if cfg.ZitiManagementAddress != "ziti-management:50051" {
+		t.Fatalf("unexpected ziti management address %q", cfg.ZitiManagementAddress)
+	}
+	if cfg.ZitiEnrollmentTimeout != 2*time.Minute {
+		t.Fatalf("unexpected enrollment timeout %s", cfg.ZitiEnrollmentTimeout)
+	}
+	if cfg.ZitiLeaseRenewalInterval != 2*time.Minute {
+		t.Fatalf("unexpected lease renewal interval %s", cfg.ZitiLeaseRenewalInterval)
+	}
+}
+
+func TestFromEnvOverridesZitiIdentityAcquisition(t *testing.T) {
+	t.Setenv("TERMINAL_PROXY_TICKET_SIGNING_KEY", "01234567890123456789012345678901!")
+	t.Setenv("ZITI_ENABLED", "true")
+	t.Setenv("ZITI_MANAGEMENT_ADDRESS", "ziti-management.platform:50051")
+	t.Setenv("ZITI_ENROLLMENT_TIMEOUT", "30s")
+	t.Setenv("ZITI_LEASE_RENEWAL_INTERVAL", "45s")
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("from env: %v", err)
+	}
+	if cfg.ZitiManagementAddress != "ziti-management.platform:50051" {
+		t.Fatalf("unexpected ziti management address %q", cfg.ZitiManagementAddress)
+	}
+	if cfg.ZitiEnrollmentTimeout != 30*time.Second {
+		t.Fatalf("unexpected enrollment timeout %s", cfg.ZitiEnrollmentTimeout)
+	}
+	if cfg.ZitiLeaseRenewalInterval != 45*time.Second {
+		t.Fatalf("unexpected lease renewal interval %s", cfg.ZitiLeaseRenewalInterval)
+	}
+}
+
+// The overlay is the only path that reaches a runner outside this cluster, so a
+// non-positive interval must fail startup rather than silently leaving the
+// identity's lease to lapse.
+func TestFromEnvRejectsNonPositiveLeaseRenewalInterval(t *testing.T) {
+	t.Setenv("TERMINAL_PROXY_TICKET_SIGNING_KEY", "01234567890123456789012345678901!")
+	t.Setenv("ZITI_ENABLED", "true")
+	t.Setenv("ZITI_LEASE_RENEWAL_INTERVAL", "0s")
+
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected a non-positive lease renewal interval to be rejected")
 	}
 }

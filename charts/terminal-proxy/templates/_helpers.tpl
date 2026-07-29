@@ -67,8 +67,14 @@
 {{- $zitiEnabled := default false $ziti.enabled -}}
 {{- $env = append $env (dict "name" "ZITI_ENABLED" "value" (printf "%t" $zitiEnabled)) -}}
 {{- if $zitiEnabled }}
-{{- $zitiIdentityFile := trimAll " \n\t" (default "/var/run/agyn/terminal-proxy-ziti/identity.json" $ziti.identityFile) -}}
-{{- $env = append $env (dict "name" "ZITI_IDENTITY_FILE" "value" $zitiIdentityFile) -}}
+{{- $managementAddress := trimAll " \n\t" (default "ziti-management:50051" $ziti.managementAddress) -}}
+{{- $env = append $env (dict "name" "ZITI_MANAGEMENT_ADDRESS" "value" $managementAddress) -}}
+{{- if $ziti.enrollmentTimeout }}
+{{- $env = append $env (dict "name" "ZITI_ENROLLMENT_TIMEOUT" "value" (trimAll " \n\t" $ziti.enrollmentTimeout)) -}}
+{{- end }}
+{{- if $ziti.leaseRenewalInterval }}
+{{- $env = append $env (dict "name" "ZITI_LEASE_RENEWAL_INTERVAL" "value" (trimAll " \n\t" $ziti.leaseRenewalInterval)) -}}
+{{- end }}
 {{- else }}
 {{- $runnerAddress := trimAll " \n\t" (default "k8s-runner:50051" .Values.terminalProxy.runnerAddress) -}}
 {{- if $runnerAddress }}
@@ -80,21 +86,3 @@
 {{- $_ := set .Values "env" (concat $env $userEnv) -}}
 {{- end -}}
 
-{{- /* Mounts the pre-enrolled Ziti identity read-only, mirroring the volume
-       pattern egress-gateway uses. The mount directory is derived from
-       ZITI_IDENTITY_FILE so the two can never drift. */ -}}
-{{- define "terminal-proxy.configureZitiIdentity" -}}
-{{- $ziti := default dict .Values.terminalProxy.ziti -}}
-{{- if default false $ziti.enabled }}
-{{- $identityFile := trimAll " \n\t" (default "/var/run/agyn/terminal-proxy-ziti/identity.json" $ziti.identityFile) -}}
-{{- $identitySecretName := trimAll " \n\t" (default "" $ziti.identitySecretName) -}}
-{{- if not $identitySecretName }}
-{{- fail "terminalProxy.ziti.identitySecretName is required when terminalProxy.ziti.enabled is true" -}}
-{{- end }}
-{{- $mountPath := dir $identityFile -}}
-{{- $mounts := append (.Values.extraVolumeMounts | default (list)) (dict "name" "ziti-identity" "mountPath" $mountPath "readOnly" true) -}}
-{{- $volumes := append (.Values.extraVolumes | default (list)) (dict "name" "ziti-identity" "secret" (dict "secretName" $identitySecretName)) -}}
-{{- $_ := set .Values "extraVolumeMounts" $mounts -}}
-{{- $_ := set .Values "extraVolumes" $volumes -}}
-{{- end }}
-{{- end -}}

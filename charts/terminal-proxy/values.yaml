@@ -185,10 +185,18 @@ terminalProxy:
     secretName: "terminal-proxy-ticket-signing-key"
     secretKey: "signingKey"
   ziti:
-    # Terminal Proxy dials runners over OpenZiti (runner-{runnerId}).
-    enabled: false
-    identityFile: "/var/run/agyn/terminal-proxy-ziti/identity.json"
-    # Pre-enrolled identity, mounted read-only like egress-gateway's.
-    identitySecretName: "terminal-proxy-ziti-identity"
-  # Direct runner address used only when ziti.enabled is false (local runs).
+    # Terminal Proxy dials runners over OpenZiti (runner-{runnerId}). This is
+    # the only path that reaches a runner outside this cluster, which runners
+    # generally are: they may be operator-managed and live in another network.
+    enabled: true
+    # An ephemeral identity is requested at startup and its lease renewed, the
+    # same way the Orchestrator obtains one for the identical dial. There is no
+    # identity to mount: the service type carries the terminal-proxy-hosts role
+    # attribute that the static dial policy grants against #runner-services.
+    managementAddress: "ziti-management:50051"
+    enrollmentTimeout: "2m"
+    leaseRenewalInterval: "2m"
+  # Direct runner address, used only when ziti.enabled is false. That bypasses
+  # the overlay and can only reach a runner sharing this cluster, so it is for
+  # local debugging — not a supported deployment.
   runnerAddress: "k8s-runner:50051"

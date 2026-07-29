@@ -21,9 +21,11 @@ type Config struct {
 	RunnersAddress        string
 	AgentsAddress         string
 	AuthorizationAddress  string
-	RunnerAddress         string
-	ZitiEnabled           bool
-	ZitiIdentityFile      string
+	RunnerAddress            string
+	ZitiEnabled              bool
+	ZitiManagementAddress    string
+	ZitiEnrollmentTimeout    time.Duration
+	ZitiLeaseRenewalInterval time.Duration
 }
 
 func FromEnv() (Config, error) {
@@ -93,7 +95,29 @@ func FromEnv() (Config, error) {
 		cfg.ZitiEnabled = parsed
 	}
 	if cfg.ZitiEnabled {
-		cfg.ZitiIdentityFile = envDefault("ZITI_IDENTITY_FILE", "/var/run/agyn/terminal-proxy-ziti/identity.json")
+		cfg.ZitiManagementAddress = envDefault("ZITI_MANAGEMENT_ADDRESS", "ziti-management:50051")
+		cfg.ZitiEnrollmentTimeout = 2 * time.Minute
+		if value := strings.TrimSpace(os.Getenv("ZITI_ENROLLMENT_TIMEOUT")); value != "" {
+			parsed, err := time.ParseDuration(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("parse ZITI_ENROLLMENT_TIMEOUT: %w", err)
+			}
+			cfg.ZitiEnrollmentTimeout = parsed
+		}
+		if cfg.ZitiEnrollmentTimeout <= 0 {
+			return Config{}, fmt.Errorf("ZITI_ENROLLMENT_TIMEOUT must be greater than 0")
+		}
+		cfg.ZitiLeaseRenewalInterval = 2 * time.Minute
+		if value := strings.TrimSpace(os.Getenv("ZITI_LEASE_RENEWAL_INTERVAL")); value != "" {
+			parsed, err := time.ParseDuration(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("parse ZITI_LEASE_RENEWAL_INTERVAL: %w", err)
+			}
+			cfg.ZitiLeaseRenewalInterval = parsed
+		}
+		if cfg.ZitiLeaseRenewalInterval <= 0 {
+			return Config{}, fmt.Errorf("ZITI_LEASE_RENEWAL_INTERVAL must be greater than 0")
+		}
 	}
 	return cfg, nil
 }
