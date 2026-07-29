@@ -16,6 +16,7 @@ import (
 	runnerv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runner/v1"
 	runnersv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runners/v1"
 	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
+	zitimgmtv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/ziti_management/v1"
 	"github.com/agynio/terminal-proxy/internal/config"
 	"github.com/agynio/terminal-proxy/internal/proxy"
 	"github.com/agynio/terminal-proxy/internal/runnerdial"
@@ -67,11 +68,30 @@ func run() error {
 		zitiManager *zitimanager.Manager
 	)
 	if cfg.ZitiEnabled {
-		zitiManager, err = zitimanager.NewFromFile(cfg.ZitiIdentityFile)
+		zitiMgmtConn, err := grpc.NewClient(cfg.ZitiManagementAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return fmt.Errorf("dial ziti management: %w", err)
+		}
+		defer closeConn(zitiMgmtConn)
+		zitiManager, err = zitimanager.New(
+			ctx,
+			zitimgmtv1.NewZitiManagementServiceClient(zitiMgmtConn),
+			cfg.ZitiEnrollmentTimeout,
+			cfg.ZitiLeaseRenewalInterval,
+		)
 		if err != nil {
 			return err
 		}
 		defer zitiManager.Close()
+		// The identity is ephemeral and garbage-collected once its lease
+		// lapses. Losing it is unrecoverable in-process, so terminate and let
+		// the restart enroll a fresh one.
+		go func() {
+			if err := <-zitiManager.IdentityLost(); err != nil {
+				log.Fatalf("terminating: %v", err)
+			}
+		}()
+		go zitiManager.RunLeaseRenewal(ctx)
 		dialer = runnerdial.NewDialer(zitiManager)
 	} else {
 		runnerConn, err := grpc.NewClient(cfg.RunnerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))

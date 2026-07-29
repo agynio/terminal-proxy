@@ -28,9 +28,14 @@ import (
 )
 
 const (
-	defaultShell         = "exec ${SHELL:-sh} -l"
-	workloadNamePrefix   = "workload-"
-	workloadListPageSize = 1000
+	defaultShell       = "exec ${SHELL:-sh} -l"
+	workloadNamePrefix = "workload-"
+
+	// mainContainerAlias names the workload's main container without knowing
+	// what it is actually called. See findExecContainer.
+	mainContainerAlias = "main"
+
+	cancelExecutionTimeout = 10 * time.Second
 
 	terminalIdentityObjectPrefix = "identity:"
 	terminalSandboxObjectPrefix  = "sandbox:"
@@ -41,7 +46,7 @@ const (
 )
 
 type RunnersClient interface {
-	ListWorkloads(context.Context, *runnersv1.ListWorkloadsRequest, ...grpc.CallOption) (*runnersv1.ListWorkloadsResponse, error)
+	GetWorkload(context.Context, *runnersv1.GetWorkloadRequest, ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error)
 	TouchWorkload(context.Context, *runnersv1.TouchWorkloadRequest, ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error)
 }
 
@@ -88,6 +93,38 @@ type Server struct {
 type terminalConn struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
+}
+
+// execState tracks what the proxy learned from the exec stream: the runner's
+// execution id (needed to release the PTY) and whether the runner already ended
+// the execution itself.
+type execState struct {
+	mu          sync.Mutex
+	executionID string
+	finished    bool
+}
+
+func (e *execState) setExecutionID(executionID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.executionID = strings.TrimSpace(executionID)
+}
+
+func (e *execState) markFinished() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.finished = true
+}
+
+// pendingExecutionID returns the execution id that still holds a PTY, or an
+// empty string when the runner already ended the execution.
+func (e *execState) pendingExecutionID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finished {
+		return ""
+	}
+	return e.executionID
 }
 
 type websocketPinger interface {
@@ -183,10 +220,19 @@ func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTick
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/terminal" {
+	switch r.URL.Path {
+	case "/healthz", "/readyz":
+		// The proxy holds no state and has no startup dependency: every session
+		// resolves its runner on attach, so liveness and readiness coincide.
+		w.WriteHeader(http.StatusOK)
+	case "/terminal":
+		s.serveTerminal(w, r)
+	default:
 		http.NotFound(w, r)
-		return
 	}
+}
+
+func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request) {
 	rawTicket := strings.TrimSpace(r.URL.Query().Get("ticket"))
 	if rawTicket == "" {
 		http.Error(w, "ticket required", http.StatusUnauthorized)
@@ -244,12 +290,16 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 		go s.touchSandboxWorkload(sessionCtx, workload.GetMeta().GetId())
 		defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
 	}
+	exec := &execState{}
 	errCh := make(chan error, 3)
 	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream) }()
-	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream) }()
+	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec) }()
 	go func() { errCh <- websocketLiveness(sessionCtx, conn, s.webSocketPingInterval, s.webSocketPingTimeout) }()
 	err = <-errCh
 	cancel()
+	// The session ended before the runner reported an exit — the client is gone
+	// (missed pongs, dropped socket, write failure) and the PTY is still held.
+	s.cancelExecution(runnerClient, exec.pendingExecutionID())
 	_ = conn.close(websocket.StatusNormalClosure, "terminal session ended")
 	if err == nil || errors.Is(err, context.Canceled) || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
 		return nil
@@ -257,23 +307,19 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 	return err
 }
 
+// loadWorkload resolves the hosting runner for a workload. The call is an
+// internal, identity-less Runners lookup: terminal access is authorized by
+// authorizeTerminal, not by the Runners service.
 func (s *Server) loadWorkload(ctx context.Context, workloadID string) (*runnersv1.Workload, error) {
-	pageToken := ""
-	for {
-		resp, err := s.runners.ListWorkloads(ctx, &runnersv1.ListWorkloadsRequest{PageSize: workloadListPageSize, PageToken: pageToken})
-		if err != nil {
-			return nil, err
-		}
-		for _, workload := range resp.GetWorkloads() {
-			if workload.GetMeta().GetId() == workloadID {
-				return workload, nil
-			}
-		}
-		pageToken = resp.GetNextPageToken()
-		if pageToken == "" {
-			return nil, status.Error(codes.NotFound, "workload not found")
-		}
+	resp, err := s.runners.GetWorkload(ctx, &runnersv1.GetWorkloadRequest{Id: workloadID})
+	if err != nil {
+		return nil, err
 	}
+	workload := resp.GetWorkload()
+	if workload == nil {
+		return nil, status.Error(codes.NotFound, "workload not found")
+	}
+	return workload, nil
 }
 
 func validateIssueTicketRequest(req *terminalproxyv1.IssueTicketRequest) (string, string, string, error) {
@@ -363,6 +409,20 @@ func (s *Server) touchWorkload(ctx context.Context, workloadID string) {
 	}
 }
 
+// cancelExecution releases the PTY the runner still holds for a session that
+// ended abnormally. The session context is already cancelled by this point, so
+// the call runs on its own bounded context.
+func (s *Server) cancelExecution(runnerClient runnerdial.RunnerClient, executionID string) {
+	if strings.TrimSpace(executionID) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cancelExecutionTimeout)
+	defer cancel()
+	if _, err := runnerClient.CancelExecution(ctx, &runnerv1.CancelExecutionRequest{ExecutionId: executionID}); err != nil {
+		log.Printf("cancel execution %s: %v", executionID, err)
+	}
+}
+
 func (s *Server) updateSandboxLastSession(ctx context.Context, sandboxID string) {
 	if strings.TrimSpace(sandboxID) == "" {
 		return
@@ -425,10 +485,24 @@ func execTargetID(workload *runnersv1.Workload, containerName string) (string, e
 	return workloadExecTargetID(workload)
 }
 
+// findExecContainer matches on the literal container name first, so a client
+// that lists a workload's containers (the Console) always gets the one it
+// picked. mainContainerAlias exists for the client that cannot: a sandbox's
+// main container is named by the orchestrator after the sandbox id
+// (sandbox-<prefix>), a name the CLI has no way to know and no business
+// reconstructing, while "the sandbox's shell" is unambiguous — a workload has
+// exactly one main container.
 func findExecContainer(workload *runnersv1.Workload, containerName string) (*runnersv1.Container, error) {
 	for _, container := range workload.GetContainers() {
 		if container.GetName() == containerName {
 			return container, nil
+		}
+	}
+	if containerName == mainContainerAlias {
+		for _, container := range workload.GetContainers() {
+			if container.GetRole() == runnersv1.ContainerRole_CONTAINER_ROLE_MAIN {
+				return container, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("container %s not found", containerName)
@@ -481,10 +555,11 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
-func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient) error {
+func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState) error {
 	for {
 		resp, err := execStream.Recv()
 		if errors.Is(err, io.EOF) {
+			exec.markFinished()
 			return conn.close(websocket.StatusNormalClosure, "exec complete")
 		}
 		if err != nil {
@@ -492,6 +567,8 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 			return err
 		}
 		switch event := resp.GetEvent().(type) {
+		case *runnerv1.ExecResponse_Started:
+			exec.setExecutionID(event.Started.GetExecutionId())
 		case *runnerv1.ExecResponse_Stdout:
 			if err := conn.write(ctx, websocket.MessageBinary, event.Stdout.GetData()); err != nil {
 				return err
@@ -501,12 +578,14 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 				return err
 			}
 		case *runnerv1.ExecResponse_Exit:
+			exec.markFinished()
 			reason := exitReason(event.Exit.GetReason())
 			if err := writeExit(ctx, conn, event.Exit.GetExitCode(), reason); err != nil {
 				return err
 			}
 			return nil
 		case *runnerv1.ExecResponse_Error:
+			exec.markFinished()
 			_ = writeExit(ctx, conn, 1, "error")
 			return fmt.Errorf("runner exec error %s: %s", event.Error.GetCode(), event.Error.GetMessage())
 		}

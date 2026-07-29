@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -138,6 +139,92 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 	}
 	eventually(t, func() bool { return runners.touchCount() >= 1 })
 	eventually(t, func() bool { return agents.lastSessionSandboxID() == sandboxID })
+	time.Sleep(20 * time.Millisecond)
+	if cancelled := runner.cancelledExecutions(); len(cancelled) != 0 {
+		t.Fatalf("expected no cancel on normal shell exit, got %v", cancelled)
+	}
+}
+
+func TestSessionResolvesRunnerWithGetWorkload(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	runners := &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	if _, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"}); err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+	gets := runners.getIDs()
+	if len(gets) != 1 || gets[0] != workloadID {
+		t.Fatalf("expected a single GetWorkload for %s, got %v", workloadID, gets)
+	}
+}
+
+func TestIssueTicketPropagatesWorkloadLookupError(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	runners := &fakeRunnersClient{getErr: status.Error(codes.NotFound, "workload not found")}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: uuid.NewString(), ContainerName: "main"})
+	assertCode(t, err, codes.NotFound)
+}
+
+func TestClientDisconnectCancelsExecution(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	runner := &fakeRunnerClient{}
+	runners := &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:         &runnersv1.EntityMeta{Id: workloadID},
+		RunnerId:     uuid.NewString(),
+		Status:       runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
+		OwnerKind:    runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
+		OwnerId:      uuid.NewString(),
+		AgentClassId: stringPtr(uuid.NewString()),
+		Containers:   []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
+	}}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{runner: runner})
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+	conn := dialTestTerminal(t, server, issued.GetTicket())
+	writeHandshake(t, conn, 80, 24)
+	_ = runner.recv(t)
+	_ = runner.recv(t)
+	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Started{Started: &runnerv1.ExecStarted{ExecutionId: "execution-1"}}}); err != nil {
+		t.Fatalf("send started: %v", err)
+	}
+	// Reading output ordered after ExecStarted proves the proxy recorded the
+	// execution id before the client goes away.
+	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Stdout{Stdout: &runnerv1.ExecOutput{Data: []byte("out")}}}); err != nil {
+		t.Fatalf("send stdout: %v", err)
+	}
+	if _, _, err := conn.Read(context.Background()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	conn.CloseNow()
+
+	eventually(t, func() bool {
+		cancelled := runner.cancelledExecutions()
+		return len(cancelled) == 1 && cancelled[0] == "execution-1"
+	})
+}
+
+func TestHealthEndpointsRespondOK(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	server := newTestServer(t, store, &fakeRunnersClient{}, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
+	for _, path := range []string{"/healthz", "/readyz"} {
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", path, recorder.Code, http.StatusOK)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("/nope status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
 }
 
 func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {
@@ -158,6 +245,28 @@ func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {
 	}
 	if _, err := execTargetID(workload, "sidecar"); err == nil {
 		t.Fatal("expected sidecar target to be rejected until Runner.Exec supports container selection")
+	}
+}
+
+func TestExecTargetResolvesMainAliasForGeneratedContainerName(t *testing.T) {
+	workloadID := uuid.NewString()
+	workload := &runnersv1.Workload{
+		Meta: &runnersv1.EntityMeta{Id: workloadID},
+		Containers: []*runnersv1.Container{
+			{Name: "ziti-sidecar", Role: runnersv1.ContainerRole_CONTAINER_ROLE_SIDECAR},
+			// What the orchestrator actually names a sandbox's container.
+			{Name: "sandbox-3706e3c5", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN},
+		},
+	}
+	targetID, err := execTargetID(workload, "main")
+	if err != nil {
+		t.Fatalf("exec target: %v", err)
+	}
+	if targetID != "workload-"+workloadID {
+		t.Fatalf("expected pod target, got %q", targetID)
+	}
+	if _, err := execTargetID(workload, "nope"); err == nil {
+		t.Fatal("expected an unknown container name to stay an error")
 	}
 }
 
@@ -382,19 +491,29 @@ func writeHandshake(t *testing.T, conn *websocket.Conn, cols, rows uint32) {
 
 type fakeRunnersClient struct {
 	workload *runnersv1.Workload
-	listErr  error
+	getErr   error
 	mu       sync.Mutex
+	gets     []string
 	touches  []string
 }
 
-func (f *fakeRunnersClient) ListWorkloads(context.Context, *runnersv1.ListWorkloadsRequest, ...grpc.CallOption) (*runnersv1.ListWorkloadsResponse, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
+func (f *fakeRunnersClient) GetWorkload(_ context.Context, req *runnersv1.GetWorkloadRequest, _ ...grpc.CallOption) (*runnersv1.GetWorkloadResponse, error) {
+	f.mu.Lock()
+	f.gets = append(f.gets, req.GetId())
+	f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, f.getErr
 	}
-	if f.workload == nil {
-		return &runnersv1.ListWorkloadsResponse{}, nil
+	if f.workload == nil || f.workload.GetMeta().GetId() != req.GetId() {
+		return nil, status.Error(codes.NotFound, "workload not found")
 	}
-	return &runnersv1.ListWorkloadsResponse{Workloads: []*runnersv1.Workload{f.workload}}, nil
+	return &runnersv1.GetWorkloadResponse{Workload: f.workload}, nil
+}
+
+func (f *fakeRunnersClient) getIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.gets...)
 }
 
 func (f *fakeRunnersClient) TouchWorkload(_ context.Context, req *runnersv1.TouchWorkloadRequest, _ ...grpc.CallOption) (*runnersv1.TouchWorkloadResponse, error) {
@@ -494,11 +613,25 @@ func (f *fakeRunnerDialer) Dial(context.Context, string) (runnerdial.RunnerClien
 func (f *fakeRunnerDialer) Close() {}
 
 type fakeRunnerClient struct {
-	once sync.Once
-	in   chan *runnerv1.ExecRequest
-	out  chan *runnerv1.ExecResponse
-	mu   sync.Mutex
-	ctx  context.Context
+	once      sync.Once
+	in        chan *runnerv1.ExecRequest
+	out       chan *runnerv1.ExecResponse
+	mu        sync.Mutex
+	ctx       context.Context
+	cancelled []string
+}
+
+func (f *fakeRunnerClient) CancelExecution(_ context.Context, req *runnerv1.CancelExecutionRequest, _ ...grpc.CallOption) (*runnerv1.CancelExecutionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelled = append(f.cancelled, req.GetExecutionId())
+	return &runnerv1.CancelExecutionResponse{}, nil
+}
+
+func (f *fakeRunnerClient) cancelledExecutions() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cancelled...)
 }
 
 func (f *fakeRunnerClient) init() {
