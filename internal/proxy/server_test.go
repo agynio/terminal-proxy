@@ -248,6 +248,28 @@ func TestExecTargetUsesWorkloadPodAndRejectsUnsupportedContainer(t *testing.T) {
 	}
 }
 
+func TestExecTargetResolvesMainAliasForGeneratedContainerName(t *testing.T) {
+	workloadID := uuid.NewString()
+	workload := &runnersv1.Workload{
+		Meta: &runnersv1.EntityMeta{Id: workloadID},
+		Containers: []*runnersv1.Container{
+			{Name: "ziti-sidecar", Role: runnersv1.ContainerRole_CONTAINER_ROLE_SIDECAR},
+			// What the orchestrator actually names a sandbox's container.
+			{Name: "sandbox-3706e3c5", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN},
+		},
+	}
+	targetID, err := execTargetID(workload, "main")
+	if err != nil {
+		t.Fatalf("exec target: %v", err)
+	}
+	if targetID != "workload-"+workloadID {
+		t.Fatalf("expected pod target, got %q", targetID)
+	}
+	if _, err := execTargetID(workload, "nope"); err == nil {
+		t.Fatal("expected an unknown container name to stay an error")
+	}
+}
+
 func TestWebSocketLivenessStopsOnMissedPong(t *testing.T) {
 	pinger := &fakePinger{err: errors.New("pong timeout")}
 	err := websocketLiveness(context.Background(), pinger, time.Millisecond, time.Millisecond)

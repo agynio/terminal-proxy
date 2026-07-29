@@ -31,6 +31,10 @@ const (
 	defaultShell       = "exec ${SHELL:-sh} -l"
 	workloadNamePrefix = "workload-"
 
+	// mainContainerAlias names the workload's main container without knowing
+	// what it is actually called. See findExecContainer.
+	mainContainerAlias = "main"
+
 	cancelExecutionTimeout = 10 * time.Second
 
 	terminalIdentityObjectPrefix = "identity:"
@@ -481,10 +485,24 @@ func execTargetID(workload *runnersv1.Workload, containerName string) (string, e
 	return workloadExecTargetID(workload)
 }
 
+// findExecContainer matches on the literal container name first, so a client
+// that lists a workload's containers (the Console) always gets the one it
+// picked. mainContainerAlias exists for the client that cannot: a sandbox's
+// main container is named by the orchestrator after the sandbox id
+// (sandbox-<prefix>), a name the CLI has no way to know and no business
+// reconstructing, while "the sandbox's shell" is unambiguous — a workload has
+// exactly one main container.
 func findExecContainer(workload *runnersv1.Workload, containerName string) (*runnersv1.Container, error) {
 	for _, container := range workload.GetContainers() {
 		if container.GetName() == containerName {
 			return container, nil
+		}
+	}
+	if containerName == mainContainerAlias {
+		for _, container := range workload.GetContainers() {
+			if container.GetRole() == runnersv1.ContainerRole_CONTAINER_ROLE_MAIN {
+				return container, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("container %s not found", containerName)
