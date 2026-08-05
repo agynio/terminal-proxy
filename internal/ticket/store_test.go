@@ -35,7 +35,7 @@ func TestIssueAndConsumeRoundTrip(t *testing.T) {
 	if claims.IdentityID != identityID || claims.WorkloadID != workloadID || claims.ContainerName != "main" {
 		t.Fatalf("unexpected claims: %#v", claims)
 	}
-	if claims.CommandShell != "exec ${SHELL:-sh} -l" {
+	if claims.CommandShell != DefaultShell {
 		t.Fatalf("unexpected default command %q", claims.CommandShell)
 	}
 	if claims.Version != version || claims.ID == "" {

@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultShell       = "exec ${SHELL:-sh} -l"
+	defaultShell       = ticket.DefaultShell
 	workloadNamePrefix = "workload-"
 
 	// mainContainerAlias names the workload's main container without knowing

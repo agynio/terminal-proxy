@@ -96,7 +96,7 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 	if start.GetStart().GetTargetId() != "workload-"+workloadID {
 		t.Fatalf("unexpected target id %q", start.GetStart().GetTargetId())
 	}
-	if start.GetStart().GetCommandShell() != "echo ready" {
+	if start.GetStart().GetCommandShell() != ticket.PathPrefix+"echo ready" {
 		t.Fatalf("unexpected command %q", start.GetStart().GetCommandShell())
 	}
 	resize := runner.recv(t)

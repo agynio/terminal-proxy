@@ -19,6 +19,13 @@ import (
 
 const version = 1
 
+// Nothing in the container puts /agyn/bin on PATH, so the session's command
+// does. Expanded in the container, so the image's own PATH survives.
+const PathPrefix = `export PATH="/agyn/bin:$PATH"; `
+
+// DefaultShell is the command when the caller names none.
+const DefaultShell = PathPrefix + "exec ${SHELL:-sh} -l"
+
 type Store struct {
 	key  []byte
 	now  func() time.Time
@@ -156,24 +163,26 @@ func parseUUID(value, field string) (string, error) {
 
 func applyCommand(claims *Claims, command *terminalproxyv1.TerminalCommand) {
 	if command == nil {
-		claims.CommandShell = "exec ${SHELL:-sh} -l"
+		claims.CommandShell = DefaultShell
 		return
 	}
 	switch value := command.GetCommand().(type) {
 	case *terminalproxyv1.TerminalCommand_Shell:
-		claims.CommandShell = strings.TrimSpace(value.Shell)
-		if claims.CommandShell == "" {
-			claims.CommandShell = "exec ${SHELL:-sh} -l"
+		shell := strings.TrimSpace(value.Shell)
+		if shell == "" {
+			claims.CommandShell = DefaultShell
+			return
 		}
+		claims.CommandShell = PathPrefix + shell
 	case *terminalproxyv1.TerminalCommand_Argv:
 		if value.Argv != nil {
 			claims.CommandArgv = cleanArgv(value.Argv.GetArgv())
 		}
 		if len(claims.CommandArgv) == 0 {
-			claims.CommandShell = "exec ${SHELL:-sh} -l"
+			claims.CommandShell = DefaultShell
 		}
 	default:
-		claims.CommandShell = "exec ${SHELL:-sh} -l"
+		claims.CommandShell = DefaultShell
 	}
 }
 
