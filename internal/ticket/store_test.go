@@ -23,7 +23,7 @@ func TestIssueAndConsumeRoundTrip(t *testing.T) {
 	identityID := uuid.NewString()
 	workloadID := uuid.NewString()
 
-	token, expiresAt, err := store.Issue(identityID, workloadID, "main", nil, 30*time.Second)
+	token, expiresAt, err := store.Issue(identityID, workloadID, "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -51,7 +51,11 @@ func TestIssueBindsCommandOverride(t *testing.T) {
 		Command: &terminalproxyv1.TerminalCommand_Argv{Argv: &terminalproxyv1.TerminalArgv{Argv: []string{"cat", "/etc/hosts"}}},
 	}
 
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", command, 30*time.Second)
+	resolved, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, command, "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_EXEC, resolved, 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -69,7 +73,7 @@ func TestIssueBindsCommandOverride(t *testing.T) {
 
 func TestConsumeRejectsTamperedSignature(t *testing.T) {
 	store := NewStore([]byte(testKey))
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -96,7 +100,7 @@ func TestConsumeRejectsExpiredTicket(t *testing.T) {
 	issuedAt := time.Now().UTC()
 	store.now = func() time.Time { return issuedAt }
 
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -105,7 +109,7 @@ func TestConsumeRejectsExpiredTicket(t *testing.T) {
 		t.Fatalf("consume before expiry: %v", err)
 	}
 
-	fresh, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	fresh, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -117,7 +121,7 @@ func TestConsumeRejectsExpiredTicket(t *testing.T) {
 
 func TestConsumeRejectsReplay(t *testing.T) {
 	store := NewStore([]byte(testKey))
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -137,7 +141,7 @@ func TestTicketFromAnotherReplicaValidates(t *testing.T) {
 	identityID := uuid.NewString()
 	workloadID := uuid.NewString()
 
-	token, _, err := issuer.Issue(identityID, workloadID, "main", nil, 30*time.Second)
+	token, _, err := issuer.Issue(identityID, workloadID, "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -158,7 +162,7 @@ func TestTicketFromReplicaWithDifferentKeyFails(t *testing.T) {
 	issuer := NewStore([]byte(testKey))
 	validator := NewStore([]byte(testOtherKey))
 
-	token, _, err := issuer.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := issuer.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -169,22 +173,26 @@ func TestTicketFromReplicaWithDifferentKeyFails(t *testing.T) {
 
 func TestIssueRejectsInvalidInput(t *testing.T) {
 	store := NewStore([]byte(testKey))
-	if _, _, err := store.Issue("not-a-uuid", uuid.NewString(), "main", nil, 30*time.Second); err == nil {
+	if _, _, err := store.Issue("not-a-uuid", uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected invalid identity to be rejected")
 	}
-	if _, _, err := store.Issue(uuid.NewString(), "not-a-uuid", "main", nil, 30*time.Second); err == nil {
+	if _, _, err := store.Issue(uuid.NewString(), "not-a-uuid", "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected invalid workload to be rejected")
 	}
-	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "  ", nil, 30*time.Second); err == nil {
+	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "  ", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected empty container name to be rejected")
 	}
-	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 0); err == nil {
+	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 0); err == nil {
 		t.Fatal("expected non-positive ttl to be rejected")
 	}
 	short := NewStore([]byte("too-short"))
-	if _, _, err := short.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second); err == nil {
+	if _, _, err := short.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected short signing key to be rejected")
 	}
+}
+
+func shellCommand() *Command {
+	return &Command{Shell: DefaultShell, TTY: true}
 }
 
 func flipLastByte(t *testing.T, encoded string) string {
