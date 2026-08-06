@@ -3,6 +3,8 @@ package ticket
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +195,57 @@ func flipLastByte(t *testing.T, encoded string) string {
 	}
 	decoded[len(decoded)-1] ^= 0xff
 	return base64.RawURLEncoding.EncodeToString(decoded)
+}
+
+// The login profile assigns PATH outright — /etc/profile on Debian and Alpine,
+// path_helper on macOS — so a prefix set ahead of the login shell is lost. The
+// command is run the way the runner runs it: /bin/sh -c <command_shell>, with
+// the final shell reading its script from stdin.
+func TestDefaultShellSurvivesTheLoginProfile(t *testing.T) {
+	printPath := `printf '%s' "$PATH"`
+
+	// Only a host whose login profile assigns PATH can tell the two forms
+	// apart. Where none does, both survive and the test proves nothing.
+	probe := exec.Command("/bin/sh", "-lc", printPath)
+	probe.Env = envWith(t, "PATH=/sentinel:"+os.Getenv("PATH"))
+	probed, err := probe.Output()
+	if err != nil {
+		t.Skipf("cannot run a login shell: %v", err)
+	}
+	if strings.HasPrefix(string(probed), "/sentinel:") {
+		t.Skip("no login profile assigns PATH on this host")
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", DefaultShell)
+	cmd.Env = envWith(t, "SHELL=/bin/sh")
+	cmd.Stdin = strings.NewReader(printPath)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run default shell: %v", err)
+	}
+	if !strings.HasPrefix(string(out), "/agyn/bin:") {
+		t.Fatalf("login profile discarded the platform PATH entry, got %q", out)
+	}
+}
+
+// envWith replaces the named variables rather than appending duplicates, which
+// the exec'd process may resolve either way.
+func envWith(t *testing.T, overrides ...string) []string {
+	t.Helper()
+	replaced := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		keep := true
+		for _, override := range overrides {
+			if strings.HasPrefix(entry, strings.SplitN(override, "=", 2)[0]+"=") {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			replaced = append(replaced, entry)
+		}
+	}
+	return append(replaced, overrides...)
 }
 
 func retargetPayload(t *testing.T, token, workloadID string) string {

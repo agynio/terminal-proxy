@@ -23,8 +23,9 @@ const version = 1
 // does. Expanded in the container, so the image's own PATH survives.
 const PathPrefix = `export PATH="/agyn/bin:$PATH"; `
 
-// DefaultShell is the command when the caller names none.
-const DefaultShell = PathPrefix + "exec ${SHELL:-sh} -l"
+// DefaultShell is the command when the caller names none. PATH goes in after
+// the login profile, which assigns it outright on Debian and Alpine.
+const DefaultShell = `exec /bin/sh -lc 'PATH=/agyn/bin:$PATH exec ${SHELL:-sh}'`
 
 type Store struct {
 	key  []byte
