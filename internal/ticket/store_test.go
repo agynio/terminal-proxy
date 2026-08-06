@@ -3,6 +3,8 @@ package ticket
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +23,7 @@ func TestIssueAndConsumeRoundTrip(t *testing.T) {
 	identityID := uuid.NewString()
 	workloadID := uuid.NewString()
 
-	token, expiresAt, err := store.Issue(identityID, workloadID, "main", nil, 30*time.Second)
+	token, expiresAt, err := store.Issue(identityID, workloadID, "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -49,7 +51,11 @@ func TestIssueBindsCommandOverride(t *testing.T) {
 		Command: &terminalproxyv1.TerminalCommand_Argv{Argv: &terminalproxyv1.TerminalArgv{Argv: []string{"cat", "/etc/hosts"}}},
 	}
 
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", command, 30*time.Second)
+	resolved, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, command, "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_EXEC, resolved, 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -67,7 +73,7 @@ func TestIssueBindsCommandOverride(t *testing.T) {
 
 func TestConsumeRejectsTamperedSignature(t *testing.T) {
 	store := NewStore([]byte(testKey))
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -94,7 +100,7 @@ func TestConsumeRejectsExpiredTicket(t *testing.T) {
 	issuedAt := time.Now().UTC()
 	store.now = func() time.Time { return issuedAt }
 
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -103,7 +109,7 @@ func TestConsumeRejectsExpiredTicket(t *testing.T) {
 		t.Fatalf("consume before expiry: %v", err)
 	}
 
-	fresh, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	fresh, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -115,7 +121,7 @@ func TestConsumeRejectsExpiredTicket(t *testing.T) {
 
 func TestConsumeRejectsReplay(t *testing.T) {
 	store := NewStore([]byte(testKey))
-	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -135,7 +141,7 @@ func TestTicketFromAnotherReplicaValidates(t *testing.T) {
 	identityID := uuid.NewString()
 	workloadID := uuid.NewString()
 
-	token, _, err := issuer.Issue(identityID, workloadID, "main", nil, 30*time.Second)
+	token, _, err := issuer.Issue(identityID, workloadID, "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -156,7 +162,7 @@ func TestTicketFromReplicaWithDifferentKeyFails(t *testing.T) {
 	issuer := NewStore([]byte(testKey))
 	validator := NewStore([]byte(testOtherKey))
 
-	token, _, err := issuer.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second)
+	token, _, err := issuer.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -167,22 +173,26 @@ func TestTicketFromReplicaWithDifferentKeyFails(t *testing.T) {
 
 func TestIssueRejectsInvalidInput(t *testing.T) {
 	store := NewStore([]byte(testKey))
-	if _, _, err := store.Issue("not-a-uuid", uuid.NewString(), "main", nil, 30*time.Second); err == nil {
+	if _, _, err := store.Issue("not-a-uuid", uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected invalid identity to be rejected")
 	}
-	if _, _, err := store.Issue(uuid.NewString(), "not-a-uuid", "main", nil, 30*time.Second); err == nil {
+	if _, _, err := store.Issue(uuid.NewString(), "not-a-uuid", "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected invalid workload to be rejected")
 	}
-	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "  ", nil, 30*time.Second); err == nil {
+	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "  ", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected empty container name to be rejected")
 	}
-	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 0); err == nil {
+	if _, _, err := store.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 0); err == nil {
 		t.Fatal("expected non-positive ttl to be rejected")
 	}
 	short := NewStore([]byte("too-short"))
-	if _, _, err := short.Issue(uuid.NewString(), uuid.NewString(), "main", nil, 30*time.Second); err == nil {
+	if _, _, err := short.Issue(uuid.NewString(), uuid.NewString(), "main", terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCommand(), 30*time.Second); err == nil {
 		t.Fatal("expected short signing key to be rejected")
 	}
+}
+
+func shellCommand() *Command {
+	return &Command{Shell: DefaultShell, TTY: true}
 }
 
 func flipLastByte(t *testing.T, encoded string) string {
@@ -193,6 +203,57 @@ func flipLastByte(t *testing.T, encoded string) string {
 	}
 	decoded[len(decoded)-1] ^= 0xff
 	return base64.RawURLEncoding.EncodeToString(decoded)
+}
+
+// The login profile assigns PATH outright — /etc/profile on Debian and Alpine,
+// path_helper on macOS — so a prefix set ahead of the login shell is lost. The
+// command is run the way the runner runs it: /bin/sh -c <command_shell>, with
+// the final shell reading its script from stdin.
+func TestDefaultShellSurvivesTheLoginProfile(t *testing.T) {
+	printPath := `printf '%s' "$PATH"`
+
+	// Only a host whose login profile assigns PATH can tell the two forms
+	// apart. Where none does, both survive and the test proves nothing.
+	probe := exec.Command("/bin/sh", "-lc", printPath)
+	probe.Env = envWith(t, "PATH=/sentinel:"+os.Getenv("PATH"))
+	probed, err := probe.Output()
+	if err != nil {
+		t.Skipf("cannot run a login shell: %v", err)
+	}
+	if strings.HasPrefix(string(probed), "/sentinel:") {
+		t.Skip("no login profile assigns PATH on this host")
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", DefaultShell)
+	cmd.Env = envWith(t, "SHELL=/bin/sh")
+	cmd.Stdin = strings.NewReader(printPath)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run default shell: %v", err)
+	}
+	if !strings.HasPrefix(string(out), "/agyn/bin:") {
+		t.Fatalf("login profile discarded the platform PATH entry, got %q", out)
+	}
+}
+
+// envWith replaces the named variables rather than appending duplicates, which
+// the exec'd process may resolve either way.
+func envWith(t *testing.T, overrides ...string) []string {
+	t.Helper()
+	replaced := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		keep := true
+		for _, override := range overrides {
+			if strings.HasPrefix(entry, strings.SplitN(override, "=", 2)[0]+"=") {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			replaced = append(replaced, entry)
+		}
+	}
+	return append(replaced, overrides...)
 }
 
 func retargetPayload(t *testing.T, token, workloadID string) string {

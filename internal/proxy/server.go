@@ -28,8 +28,11 @@ import (
 )
 
 const (
-	defaultShell       = ticket.DefaultShell
 	workloadNamePrefix = "workload-"
+
+	// Stream identifiers prefixed to non-TTY output frames.
+	streamStdout byte = 0
+	streamStderr byte = 1
 
 	// mainContainerAlias names the workload's main container without knowing
 	// what it is actually called. See findExecContainer.
@@ -59,7 +62,7 @@ type AgentsClient interface {
 }
 
 type TicketStore interface {
-	Issue(string, string, string, *terminalproxyv1.TerminalCommand, time.Duration) (string, time.Time, error)
+	Issue(string, string, string, terminalproxyv1.SessionKind, *ticket.Command, time.Duration) (string, time.Time, error)
 	Consume(string) (*ticket.Claims, error)
 }
 
@@ -208,7 +211,11 @@ func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTick
 	if err := s.authorizeTerminal(ctx, identityID, workload); err != nil {
 		return nil, err
 	}
-	token, expiresAt, err := s.tickets.Issue(identityID, workloadID, containerName, req.GetCommand(), s.ticketTTL)
+	command, err := ticket.Resolve(req.GetKind(), req.GetCommand(), req.GetSyncRoot())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	token, expiresAt, err := s.tickets.Issue(identityID, workloadID, containerName, req.GetKind(), command, s.ticketTTL)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -254,9 +261,13 @@ func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *ticket.Claims) error {
-	hs, err := readHandshake(ctx, conn.conn)
-	if err != nil {
-		return closeWithError(ctx, conn, websocket.StatusPolicyViolation, err.Error())
+	var hs handshake
+	if claims.TTY {
+		read, err := readHandshake(ctx, conn.conn)
+		if err != nil {
+			return closeWithError(ctx, conn, websocket.StatusPolicyViolation, err.Error())
+		}
+		hs = read
 	}
 	workload, err := s.loadWorkload(ctx, claims.WorkloadID)
 	if err != nil {
@@ -283,17 +294,22 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 	if err := execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Start{Start: startRequest(claims, targetID)}}); err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
-	if err := sendResize(execStream, hs.Cols, hs.Rows); err != nil {
-		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+	if claims.TTY {
+		if err := sendResize(execStream, hs.Cols, hs.Rows); err != nil {
+			return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
+		}
 	}
-	if workload.GetOwnerKind() == runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX {
+	// SYNC sessions never report activity. A background sync session would
+	// otherwise keep a sandbox running for as long as a laptop stayed
+	// connected, defeating the idle timeout and the metering it bounds.
+	if claims.TTY && workload.GetOwnerKind() == runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX {
 		go s.touchSandboxWorkload(sessionCtx, workload.GetMeta().GetId())
 		defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
 	}
 	exec := &execState{}
 	errCh := make(chan error, 3)
-	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream) }()
-	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec) }()
+	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream, claims.TTY) }()
+	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec, claims.TTY) }()
 	go func() { errCh <- websocketLiveness(sessionCtx, conn, s.webSocketPingInterval, s.webSocketPingTimeout) }()
 	err = <-errCh
 	cancel()
@@ -458,14 +474,14 @@ func startRequest(claims *ticket.Claims, targetID string) *runnerv1.ExecStartReq
 	start := &runnerv1.ExecStartRequest{
 		RequestId: claims.ID,
 		TargetId:  targetID,
-		Options:   &runnerv1.ExecOptions{Tty: true},
+		// A non-TTY session needs the streams kept apart: one byte of stderr
+		// inside the protocol stream corrupts it beyond recovery.
+		Options: &runnerv1.ExecOptions{Tty: claims.TTY, SeparateStderr: !claims.TTY},
 	}
 	if len(claims.CommandArgv) > 0 {
 		start.CommandArgv = append([]string(nil), claims.CommandArgv...)
-	} else if strings.TrimSpace(claims.CommandShell) != "" {
-		start.CommandShell = claims.CommandShell
 	} else {
-		start.CommandShell = defaultShell
+		start.CommandShell = claims.CommandShell
 	}
 	return start
 }
@@ -528,7 +544,7 @@ func runnerPodTargetID(id string) string {
 	return workloadNamePrefix + id
 }
 
-func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runnerv1.RunnerService_ExecClient) error {
+func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runnerv1.RunnerService_ExecClient, tty bool) error {
 	for {
 		messageType, data, err := conn.Read(ctx)
 		if err != nil {
@@ -548,6 +564,9 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 			if frame.Type != "resize" {
 				return fmt.Errorf("unsupported control frame %q", frame.Type)
 			}
+			if !tty {
+				return errors.New("resize is meaningful only to TTY sessions")
+			}
 			if err := sendResize(execStream, frame.Cols, frame.Rows); err != nil {
 				return err
 			}
@@ -555,7 +574,7 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
-func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState) error {
+func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState, tty bool) error {
 	for {
 		resp, err := execStream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -570,11 +589,11 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 		case *runnerv1.ExecResponse_Started:
 			exec.setExecutionID(event.Started.GetExecutionId())
 		case *runnerv1.ExecResponse_Stdout:
-			if err := conn.write(ctx, websocket.MessageBinary, event.Stdout.GetData()); err != nil {
+			if err := conn.write(ctx, websocket.MessageBinary, tagged(tty, streamStdout, event.Stdout.GetData())); err != nil {
 				return err
 			}
 		case *runnerv1.ExecResponse_Stderr:
-			if err := conn.write(ctx, websocket.MessageBinary, event.Stderr.GetData()); err != nil {
+			if err := conn.write(ctx, websocket.MessageBinary, tagged(tty, streamStderr, event.Stderr.GetData())); err != nil {
 				return err
 			}
 		case *runnerv1.ExecResponse_Exit:
@@ -590,6 +609,18 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 			return fmt.Errorf("runner exec error %s: %s", event.Error.GetCode(), event.Error.GetMessage())
 		}
 	}
+}
+
+// tagged prefixes non-TTY output with the stream it came from. TTY output is
+// left untouched: a PTY merges the two at the kernel anyway, and every existing
+// client reads those frames as raw bytes.
+func tagged(tty bool, stream byte, data []byte) []byte {
+	if tty {
+		return data
+	}
+	framed := make([]byte, 0, len(data)+1)
+	framed = append(framed, stream)
+	return append(framed, data...)
 }
 
 func websocketLiveness(ctx context.Context, pinger websocketPinger, interval, timeout time.Duration) error {

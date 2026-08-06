@@ -19,13 +19,6 @@ import (
 
 const version = 1
 
-// Nothing in the container puts /agyn/bin on PATH, so the session's command
-// does. Expanded in the container, so the image's own PATH survives.
-const PathPrefix = `export PATH="/agyn/bin:$PATH"; `
-
-// DefaultShell is the command when the caller names none.
-const DefaultShell = PathPrefix + "exec ${SHELL:-sh} -l"
-
 type Store struct {
 	key  []byte
 	now  func() time.Time
@@ -41,6 +34,8 @@ type Claims struct {
 	ContainerName string   `json:"container_name"`
 	CommandShell  string   `json:"command_shell,omitempty"`
 	CommandArgv   []string `json:"command_argv,omitempty"`
+	Kind          int32    `json:"kind"`
+	TTY           bool     `json:"tty"`
 	IssuedAt      int64    `json:"iat"`
 	ExpiresAt     int64    `json:"exp"`
 }
@@ -50,7 +45,7 @@ func NewStore(key []byte) *Store {
 	return &Store{key: copied, now: time.Now, used: map[string]time.Time{}}
 }
 
-func (s *Store) Issue(identityID, workloadID, containerName string, command *terminalproxyv1.TerminalCommand, ttl time.Duration) (string, time.Time, error) {
+func (s *Store) Issue(identityID, workloadID, containerName string, kind terminalproxyv1.SessionKind, command *Command, ttl time.Duration) (string, time.Time, error) {
 	if len(s.key) < 32 {
 		return "", time.Time{}, errors.New("ticket signing key must be at least 32 bytes")
 	}
@@ -69,14 +64,20 @@ func (s *Store) Issue(identityID, workloadID, containerName string, command *ter
 	if ttl <= 0 {
 		return "", time.Time{}, errors.New("ticket ttl must be greater than 0")
 	}
+	if command == nil {
+		return "", time.Time{}, errors.New("command is required")
+	}
 	claims := Claims{
 		Version:       version,
 		ID:            uuid.NewString(),
 		IdentityID:    identityID,
 		WorkloadID:    workloadID,
 		ContainerName: containerName,
+		CommandShell:  command.Shell,
+		CommandArgv:   command.Argv,
+		Kind:          int32(kind),
+		TTY:           command.TTY,
 	}
-	applyCommand(&claims, command)
 	now := s.now().UTC()
 	claims.IssuedAt = now.Unix()
 	expiresAt := now.Add(ttl)
@@ -142,6 +143,9 @@ func (s *Store) verify(raw string) (*Claims, error) {
 	if claims.Version != version || claims.ID == "" || claims.IdentityID == "" || claims.WorkloadID == "" || claims.ContainerName == "" || claims.ExpiresAt == 0 {
 		return nil, errors.New("ticket claims invalid")
 	}
+	if claims.CommandShell == "" && len(claims.CommandArgv) == 0 {
+		return nil, errors.New("ticket names no command")
+	}
 	return &claims, nil
 }
 
@@ -159,42 +163,6 @@ func parseUUID(value, field string) (string, error) {
 		return "", fmt.Errorf("%s must be a UUID", field)
 	}
 	return parsed.String(), nil
-}
-
-func applyCommand(claims *Claims, command *terminalproxyv1.TerminalCommand) {
-	if command == nil {
-		claims.CommandShell = DefaultShell
-		return
-	}
-	switch value := command.GetCommand().(type) {
-	case *terminalproxyv1.TerminalCommand_Shell:
-		shell := strings.TrimSpace(value.Shell)
-		if shell == "" {
-			claims.CommandShell = DefaultShell
-			return
-		}
-		claims.CommandShell = PathPrefix + shell
-	case *terminalproxyv1.TerminalCommand_Argv:
-		if value.Argv != nil {
-			claims.CommandArgv = cleanArgv(value.Argv.GetArgv())
-		}
-		if len(claims.CommandArgv) == 0 {
-			claims.CommandShell = DefaultShell
-		}
-	default:
-		claims.CommandShell = DefaultShell
-	}
-}
-
-func cleanArgv(argv []string) []string {
-	cleaned := make([]string, 0, len(argv))
-	for _, arg := range argv {
-		if strings.TrimSpace(arg) == "" {
-			continue
-		}
-		cleaned = append(cleaned, arg)
-	}
-	return cleaned
 }
 
 func RandomKey() []byte {

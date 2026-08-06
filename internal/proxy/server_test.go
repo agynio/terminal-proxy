@@ -32,7 +32,7 @@ func TestIssueTicketReturnsSignedShortLivedTicket(t *testing.T) {
 	sandboxID := uuid.NewString()
 	authorization := &fakeAuthorizationClient{allowed: true}
 	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, sandboxID)}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
-	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
+	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
@@ -81,6 +81,7 @@ func TestWebSocketBridgesRunnerExecAndSandboxActivity(t *testing.T) {
 		IdentityId:    uuid.NewString(),
 		WorkloadId:    workloadID,
 		ContainerName: "main",
+		Kind:          terminalproxyv1.SessionKind_SESSION_KIND_EXEC,
 		Command:       &terminalproxyv1.TerminalCommand{Command: &terminalproxyv1.TerminalCommand_Shell{Shell: "echo ready"}},
 	})
 	if err != nil {
@@ -151,7 +152,7 @@ func TestSessionResolvesRunnerWithGetWorkload(t *testing.T) {
 	runners := &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}
 	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	if _, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"}); err != nil {
+	if _, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL}); err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
 	gets := runners.getIDs()
@@ -165,7 +166,7 @@ func TestIssueTicketPropagatesWorkloadLookupError(t *testing.T) {
 	runners := &fakeRunnersClient{getErr: status.Error(codes.NotFound, "workload not found")}
 	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: uuid.NewString(), ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: uuid.NewString(), ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.NotFound)
 }
 
@@ -183,7 +184,7 @@ func TestClientDisconnectCancelsExecution(t *testing.T) {
 		Containers:   []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
 	}}
 	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{runner: runner})
-	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
@@ -289,7 +290,7 @@ func TestIssueTicketAuthorizesSandboxWorkload(t *testing.T) {
 	authorization := &fakeAuthorizationClient{allowed: true}
 	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, sandboxID)}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
+	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
@@ -307,7 +308,7 @@ func TestIssueTicketDeniesSandboxWorkload(t *testing.T) {
 	workloadID := uuid.NewString()
 	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}, &fakeAuthorizationClient{}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.PermissionDenied)
 	if store.issueCount() != 0 {
 		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
@@ -322,7 +323,7 @@ func TestIssueTicketAuthorizesAgentWorkload(t *testing.T) {
 	authorization := &fakeAuthorizationClient{allowed: true}
 	server := newTestServer(t, store, &fakeRunnersClient{workload: agentWorkload(workloadID, agentID)}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main"})
+	resp, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: identityID, WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
@@ -337,7 +338,7 @@ func TestIssueTicketDeniesAgentWorkload(t *testing.T) {
 	workloadID := uuid.NewString()
 	server := newTestServer(t, store, &fakeRunnersClient{workload: agentWorkload(workloadID, uuid.NewString())}, &fakeAuthorizationClient{}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.PermissionDenied)
 	if store.issueCount() != 0 {
 		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
@@ -353,7 +354,7 @@ func TestIssueTicketDeniesUnsupportedOwnerKind(t *testing.T) {
 		OwnerKind: runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_UNSPECIFIED,
 	}}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.PermissionDenied)
 	if authorization.checkCount() != 0 {
 		t.Fatalf("expected no authorization call, got %d", authorization.checkCount())
@@ -373,7 +374,7 @@ func TestIssueTicketDeniesMalformedOwner(t *testing.T) {
 		OwnerId:   "not-a-uuid",
 	}}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.PermissionDenied)
 	if authorization.checkCount() != 0 {
 		t.Fatalf("expected no authorization call, got %d", authorization.checkCount())
@@ -388,7 +389,7 @@ func TestIssueTicketPropagatesAuthorizationError(t *testing.T) {
 	workloadID := uuid.NewString()
 	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(workloadID, uuid.NewString())}, &fakeAuthorizationClient{err: status.Error(codes.Unavailable, "authz unavailable")}, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.Unavailable)
 	if store.issueCount() != 0 {
 		t.Fatalf("expected no ticket before authz, got %d", store.issueCount())
@@ -400,7 +401,7 @@ func TestIssueTicketDoesNotAuthorizeOrIssueForInvalidRequest(t *testing.T) {
 	authorization := &fakeAuthorizationClient{allowed: true}
 	server := newTestServer(t, store, &fakeRunnersClient{workload: sandboxWorkload(uuid.NewString(), uuid.NewString())}, authorization, &fakeAgentsClient{}, &fakeRunnerDialer{})
 
-	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: "not-a-uuid", WorkloadId: uuid.NewString(), ContainerName: "main"})
+	_, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: "not-a-uuid", WorkloadId: uuid.NewString(), ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	assertCode(t, err, codes.InvalidArgument)
 	if authorization.checkCount() != 0 {
 		t.Fatalf("expected no authorization call, got %d", authorization.checkCount())
@@ -425,7 +426,7 @@ func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	}}
 	agents := &fakeAgentsClient{}
 	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, agents, &fakeRunnerDialer{runner: runner})
-	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main"})
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
 	}
@@ -567,11 +568,11 @@ type countingTicketStore struct {
 	count int
 }
 
-func (s *countingTicketStore) Issue(identityID, workloadID, containerName string, command *terminalproxyv1.TerminalCommand, ttl time.Duration) (string, time.Time, error) {
+func (s *countingTicketStore) Issue(identityID, workloadID, containerName string, kind terminalproxyv1.SessionKind, command *ticket.Command, ttl time.Duration) (string, time.Time, error) {
 	s.mu.Lock()
 	s.count++
 	s.mu.Unlock()
-	return s.store.Issue(identityID, workloadID, containerName, command, ttl)
+	return s.store.Issue(identityID, workloadID, containerName, kind, command, ttl)
 }
 
 func (s *countingTicketStore) Consume(raw string) (*ticket.Claims, error) {
@@ -773,3 +774,89 @@ func assertCode(t *testing.T, err error, code codes.Code) {
 }
 
 func stringPtr(value string) *string { return &value }
+
+// A SYNC session is non-TTY, sends no handshake, tags its output streams, and
+// reports no sandbox activity — a background sync must not keep a sandbox alive
+// for as long as a laptop stays connected.
+func TestSyncSessionIsNonTTYTaggedAndSilentOnActivity(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	sandboxID := uuid.NewString()
+	runner := &fakeRunnerClient{}
+	runners := &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:       &runnersv1.EntityMeta{Id: workloadID},
+		RunnerId:   uuid.NewString(),
+		Status:     runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
+		OwnerKind:  runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX,
+		OwnerId:    sandboxID,
+		InstanceId: stringPtr("workload-" + workloadID),
+		Containers: []*runnersv1.Container{
+			{Name: "main", ContainerId: "container-runtime-id", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN, Status: runnersv1.ContainerStatus_CONTAINER_STATUS_RUNNING},
+		},
+	}}
+	agents := &fakeAgentsClient{}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, agents, &fakeRunnerDialer{runner: runner})
+
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{
+		IdentityId:    uuid.NewString(),
+		WorkloadId:    workloadID,
+		ContainerName: "main",
+		Kind:          terminalproxyv1.SessionKind_SESSION_KIND_SYNC,
+		SyncRoot:      "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+
+	conn := dialTestTerminal(t, server, issued.GetTicket())
+	defer conn.CloseNow()
+	// No handshake: a sync session has no terminal size to report.
+
+	start := runner.recv(t)
+	if start.GetStart() == nil {
+		t.Fatalf("expected start, got %v", start)
+	}
+	options := start.GetStart().GetOptions()
+	if options.GetTty() {
+		t.Fatal("SYNC allocated a PTY, which would merge stderr into the protocol stream")
+	}
+	if !options.GetSeparateStderr() {
+		t.Fatal("SYNC did not ask for the streams to be kept apart")
+	}
+	if argv := start.GetStart().GetCommandArgv(); len(argv) == 0 || argv[0] != "/agyn/bin/agyn" {
+		t.Fatalf("expected the endpoint by absolute path, got %v", argv)
+	}
+
+	// Output carries a one-byte stream tag so a diagnostic cannot be mistaken
+	// for a protocol frame.
+	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Stdout{Stdout: &runnerv1.ExecOutput{Data: []byte("frame")}}}); err != nil {
+		t.Fatalf("send stdout: %v", err)
+	}
+	_, data, err := conn.Read(context.Background())
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if len(data) != 6 || data[0] != 0 || string(data[1:]) != "frame" {
+		t.Fatalf("stdout not tagged: %q", data)
+	}
+
+	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Stderr{Stderr: &runnerv1.ExecOutput{Data: []byte("warn")}}}); err != nil {
+		t.Fatalf("send stderr: %v", err)
+	}
+	_, data, err = conn.Read(context.Background())
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	if len(data) != 5 || data[0] != 1 || string(data[1:]) != "warn" {
+		t.Fatalf("stderr not tagged distinctly: %q", data)
+	}
+
+	// The sandbox must idle out from under an active sync session.
+	time.Sleep(50 * time.Millisecond)
+	if count := runners.touchCount(); count != 0 {
+		t.Fatalf("SYNC reported %d activity touches; it must report none", count)
+	}
+	if id := agents.lastSessionSandboxID(); id != "" {
+		t.Fatalf("SYNC updated last_session_at for %s; it must not", id)
+	}
+}
