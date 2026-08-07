@@ -860,3 +860,54 @@ func TestSyncSessionIsNonTTYTaggedAndSilentOnActivity(t *testing.T) {
 		t.Fatalf("SYNC updated last_session_at for %s; it must not", id)
 	}
 }
+
+// The sync endpoint streams bodies in 64 KiB chunks. The websocket library caps
+// inbound frames at 32 KiB by default, which rejected every one of them with
+// StatusMessageTooBig — a copy of anything larger than 32 KiB never got through.
+func TestLargeClientFrameIsAccepted(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	runner := &fakeRunnerClient{}
+	runners := &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:       &runnersv1.EntityMeta{Id: workloadID},
+		RunnerId:   uuid.NewString(),
+		Status:     runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
+		OwnerKind:  runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX,
+		OwnerId:    uuid.NewString(),
+		InstanceId: stringPtr("workload-" + workloadID),
+		Containers: []*runnersv1.Container{
+			{Name: "main", ContainerId: "c", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN, Status: runnersv1.ContainerStatus_CONTAINER_STATUS_RUNNING},
+		},
+	}}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{runner: runner})
+
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{
+		IdentityId:    uuid.NewString(),
+		WorkloadId:    workloadID,
+		ContainerName: "main",
+		Kind:          terminalproxyv1.SessionKind_SESSION_KIND_SYNC,
+		SyncRoot:      "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+
+	conn := dialTestTerminal(t, server, issued.GetTicket())
+	defer conn.CloseNow()
+	if start := runner.recv(t); start.GetStart() == nil {
+		t.Fatalf("expected start, got %v", start)
+	}
+
+	// One protocol chunk, larger than the old 32 KiB cap.
+	payload := make([]byte, 64*1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if err := conn.Write(context.Background(), websocket.MessageBinary, payload); err != nil {
+		t.Fatalf("write 64 KiB frame: %v", err)
+	}
+	stdin := runner.recv(t)
+	if got := len(stdin.GetStdin().GetData()); got != len(payload) {
+		t.Fatalf("frame truncated or rejected: forwarded %d of %d bytes", got, len(payload))
+	}
+}

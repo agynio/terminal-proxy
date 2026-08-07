@@ -147375,3 +147375,8 @@
 {"level":"info","msg":"dev:terminal-proxy logs  terminal-proxy: go: downloading github.com/go-logr/stdr v1.2.2","time":"2026-07-30T23:28:28+02:00"}
 {"level":"info","msg":"dev:terminal-proxy logs  terminal-proxy: go: downloading go.opentelemetry.io/auto/sdk v1.2.1","time":"2026-07-30T23:28:28+02:00"}
 {"level":"info","msg":"dev:terminal-proxy logs  terminal-proxy: go: downloading github.com/cespare/xxhash/v2 v2.3.0","time":"2026-07-30T23:28:28+02:00"}
+{"level":"info","msg":"dev:terminal-proxy Waiting for pod to become ready...","time":"2026-08-06T16:39:55+02:00"}
+{"level":"info","msg":"dev:terminal-proxy Selected pod terminal-proxy-5d64d46c5-kfltn","time":"2026-08-06T16:39:56+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Sync started on: ./ \u003c-\u003e /opt/app/data","time":"2026-08-06T16:39:58+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Waiting for initial sync to complete","time":"2026-08-06T16:39:58+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Initial sync completed","time":"2026-08-06T16:40:01+02:00"}
