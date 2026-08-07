@@ -34,6 +34,11 @@ const (
 	streamStdout byte = 0
 	streamStderr byte = 1
 
+	// maxFrameSize bounds a single inbound WebSocket frame. It is generous
+	// because the proxy is a byte pipe: it exists to stop a malformed peer
+	// exhausting memory, not to constrain what a session kind may send.
+	maxFrameSize = 16 << 20
+
 	// mainContainerAlias names the workload's main container without knowing
 	// what it is actually called. See findExecContainer.
 	mainContainerAlias = "main"
@@ -254,6 +259,12 @@ func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	// The library caps inbound frames at 32 KiB by default. The proxy does not
+	// interpret what it carries, so an arbitrary cap simply breaks consumers
+	// whose frames are larger: the sync endpoint protocol streams bodies in
+	// 64 KiB chunks and every one of them would be rejected with
+	// StatusMessageTooBig.
+	conn.SetReadLimit(maxFrameSize)
 	defer conn.CloseNow()
 	if err := s.handleSession(r.Context(), &terminalConn{conn: conn}, claims); err != nil {
 		log.Printf("terminal session %s failed: %v", claims.ID, err)
