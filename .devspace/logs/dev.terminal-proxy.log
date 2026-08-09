@@ -9855,3 +9855,10 @@
 {"level":"info","msg":"Upstream - Upload 42 create change(s) (Uncompressed ~1627.64 KB)","time":"2026-08-06T16:40:00+02:00"}
 {"level":"info","msg":"Upstream - Successfully processed 42 change(s)","time":"2026-08-06T16:40:00+02:00"}
 {"level":"info","msg":"Upstream - Initial sync completed","time":"2026-08-06T16:40:01+02:00"}
+{"level":"info","msg":"Inject devspacehelper...","time":"2026-08-07T16:12:37+02:00"}
+{"level":"info","msg":"Successfully injected devspacehelper into pod platform/terminal-proxy-56d78bf44b-zdtx8","time":"2026-08-07T16:12:39+02:00"}
+{"level":"info","msg":"Start syncing","time":"2026-08-07T16:12:39+02:00"}
+{"level":"info","msg":"Downstream - Initial sync completed","time":"2026-08-07T16:12:39+02:00"}
+{"level":"info","msg":"Upstream - Upload 28 create change(s) (Uncompressed ~247.63 KB)","time":"2026-08-07T16:12:40+02:00"}
+{"level":"info","msg":"Upstream - Successfully processed 28 change(s)","time":"2026-08-07T16:12:40+02:00"}
+{"level":"info","msg":"Upstream - Initial sync completed","time":"2026-08-07T16:12:41+02:00"}
