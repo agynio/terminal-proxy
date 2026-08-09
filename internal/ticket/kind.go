@@ -28,7 +28,11 @@ const PathPrefix = `export PATH="` + platformBinDir + `:$PATH"; `
 // /etc/profile assigns PATH outright on Debian and Alpine, so a prefix set
 // ahead of a login shell is discarded. The final shell is not a login shell as
 // a result: /etc/profile and ~/.profile have run, ~/.bash_profile has not.
-const DefaultShell = `exec /bin/sh -lc 'PATH=` + platformBinDir + `:$PATH exec ${SHELL:-sh}'`
+//
+// LANG is defaulted rather than forced: an image that names its own locale
+// keeps it. Without one glibc falls back to C, where every byte of a multi-byte
+// keystroke is undecodable and zsh's line editor renders each as <ffffffff>.
+const DefaultShell = `exec /bin/sh -lc 'PATH=` + platformBinDir + `:$PATH LANG=${LANG:-C.UTF-8} exec ${SHELL:-sh}'`
 
 // Command is what a kind resolves to.
 type Command struct {

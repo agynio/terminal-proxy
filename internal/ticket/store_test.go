@@ -236,6 +236,34 @@ func TestDefaultShellSurvivesTheLoginProfile(t *testing.T) {
 	}
 }
 
+// An image that names no locale leaves glibc in C, where a typed accent or
+// Cyrillic letter reaches the shell as bytes it cannot decode. The default is
+// applied to the shell that is exec'd, and only when the image named none.
+func TestDefaultShellNamesAUTF8Locale(t *testing.T) {
+	printLang := `printf '%s' "$LANG"`
+
+	run := func(lang string) string {
+		t.Helper()
+		cmd := exec.Command("/bin/sh", "-c", DefaultShell)
+		cmd.Env = envWith(t, "SHELL=/bin/sh", "LANG="+lang)
+		cmd.Stdin = strings.NewReader(printLang)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("run default shell: %v", err)
+		}
+		return string(out)
+	}
+
+	if got := run(""); got != "C.UTF-8" {
+		t.Fatalf("shell started without a UTF-8 locale, got LANG=%q", got)
+	}
+	// Only a host whose login profile leaves LANG alone can tell a preserved
+	// locale from an overwritten one.
+	if got := run("en_GB.UTF-8"); got != "en_GB.UTF-8" {
+		t.Skipf("login profile assigns LANG on this host, got %q", got)
+	}
+}
+
 // envWith replaces the named variables rather than appending duplicates, which
 // the exec'd process may resolve either way.
 func envWith(t *testing.T, overrides ...string) []string {
