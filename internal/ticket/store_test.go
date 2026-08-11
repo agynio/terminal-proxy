@@ -51,7 +51,7 @@ func TestIssueBindsCommandOverride(t *testing.T) {
 		Command: &terminalproxyv1.TerminalCommand_Argv{Argv: &terminalproxyv1.TerminalArgv{Argv: []string{"cat", "/etc/hosts"}}},
 	}
 
-	resolved, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, command, "")
+	resolved, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, command, "", "", "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

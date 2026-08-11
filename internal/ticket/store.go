@@ -34,7 +34,10 @@ type Claims struct {
 	ContainerName string   `json:"container_name"`
 	CommandShell  string   `json:"command_shell,omitempty"`
 	CommandArgv   []string `json:"command_argv,omitempty"`
-	Kind          int32    `json:"kind"`
+	// Env is bound with the command and for the same reason: what the session
+	// runs must not be changeable at attach time.
+	Env  []string `json:"env,omitempty"`
+	Kind int32    `json:"kind"`
 	TTY           bool     `json:"tty"`
 	IssuedAt      int64    `json:"iat"`
 	ExpiresAt     int64    `json:"exp"`
@@ -75,6 +78,7 @@ func (s *Store) Issue(identityID, workloadID, containerName string, kind termina
 		ContainerName: containerName,
 		CommandShell:  command.Shell,
 		CommandArgv:   command.Argv,
+		Env:           command.Env,
 		Kind:          int32(kind),
 		TTY:           command.TTY,
 	}
