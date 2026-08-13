@@ -9869,3 +9869,8 @@
 {"level":"info","msg":"Upstream - Upload 30 create change(s) (Uncompressed ~266.51 KB)","time":"2026-08-13T23:32:06+02:00"}
 {"level":"info","msg":"Upstream - Successfully processed 30 change(s)","time":"2026-08-13T23:32:06+02:00"}
 {"level":"info","msg":"Upstream - Initial sync completed","time":"2026-08-13T23:32:07+02:00"}
+{"level":"info","msg":"Start syncing","time":"2026-08-14T01:18:48+02:00"}
+{"level":"info","msg":"Downstream - Initial sync completed","time":"2026-08-14T01:18:48+02:00"}
+{"level":"info","msg":"Upstream - Upload 7 create change(s) (Uncompressed ~67.40 KB)","time":"2026-08-14T01:18:49+02:00"}
+{"level":"info","msg":"Upstream - Successfully processed 7 change(s)","time":"2026-08-14T01:18:49+02:00"}
+{"level":"info","msg":"Upstream - Initial sync completed","time":"2026-08-14T01:18:50+02:00"}

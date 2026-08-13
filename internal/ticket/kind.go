@@ -97,6 +97,14 @@ type Command struct {
 // connection is the environment's answer, and two clients against one sandbox
 // must not be able to disagree about it.
 func Resolve(kind terminalproxyv1.SessionKind, command *terminalproxyv1.TerminalCommand, syncRoot, shellID, shellCwd string, persistent bool) (*Command, error) {
+	// SHELL_ATTACH is deprecated and means SHELL. A client mid-rollout still
+	// asking for it deserves a working shell, not an InvalidArgument -- and the
+	// two now mean the same thing, since the workload decides whether the shell
+	// it names persists.
+	if kind == terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH {
+		kind = terminalproxyv1.SessionKind_SESSION_KIND_SHELL
+	}
+
 	if kind != terminalproxyv1.SessionKind_SESSION_KIND_SHELL {
 		if strings.TrimSpace(shellID) != "" || strings.TrimSpace(shellCwd) != "" {
 			return nil, errors.New("shell_id and shell_cwd are meaningful only for SHELL")
