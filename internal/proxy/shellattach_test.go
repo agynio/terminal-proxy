@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	runnerv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/runner/v1"
-	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
 	"github.com/agynio/terminal-proxy/internal/ticket"
 )
 
@@ -15,7 +14,7 @@ import (
 func TestExitReasonDistinguishesDisplacement(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
-		kind       terminalproxyv1.SessionKind
+		persistent bool
 		reason     runnerv1.ExecExitReason
 		code       int32
 		wantReason string
@@ -23,7 +22,7 @@ func TestExitReasonDistinguishesDisplacement(t *testing.T) {
 	}{
 		{
 			name:       "displaced",
-			kind:       terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH,
+			persistent: true,
 			reason:     runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED,
 			code:       ticket.ExitDisplaced,
 			wantReason: "displaced",
@@ -33,7 +32,7 @@ func TestExitReasonDistinguishesDisplacement(t *testing.T) {
 		},
 		{
 			name:       "shell exited",
-			kind:       terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH,
+			persistent: true,
 			reason:     runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED,
 			code:       0,
 			wantReason: "completed",
@@ -41,17 +40,17 @@ func TestExitReasonDistinguishesDisplacement(t *testing.T) {
 		},
 		{
 			name:       "shell exited nonzero",
-			kind:       terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH,
+			persistent: true,
 			reason:     runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED,
 			code:       2,
 			wantReason: "completed",
 			wantCode:   2,
 		},
 		{
-			// The code means nothing for a kind whose command does not report
-			// it, and an ephemeral shell exiting 91 is just an exit status.
+			// Nothing reports it on an ephemeral shell, so 91 there is just an
+			// exit status.
 			name:       "same code on an ephemeral shell",
-			kind:       terminalproxyv1.SessionKind_SESSION_KIND_SHELL,
+			persistent: false,
 			reason:     runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED,
 			code:       ticket.ExitDisplaced,
 			wantReason: "completed",
@@ -59,7 +58,7 @@ func TestExitReasonDistinguishesDisplacement(t *testing.T) {
 		},
 		{
 			name:       "workload stopped mid-session",
-			kind:       terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH,
+			persistent: true,
 			reason:     runnerv1.ExecExitReason_EXEC_EXIT_REASON_CANCELLED,
 			code:       ticket.ExitDisplaced,
 			wantReason: "cancelled",
@@ -67,7 +66,7 @@ func TestExitReasonDistinguishesDisplacement(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reason, code := exitReason(tc.reason, tc.code, tc.kind)
+			reason, code := exitReason(tc.reason, tc.code, tc.persistent)
 			if reason != tc.wantReason || code != tc.wantCode {
 				t.Fatalf("got (%s, %d), want (%s, %d)", reason, code, tc.wantReason, tc.wantCode)
 			}

@@ -59,7 +59,7 @@ const (
 	tmuxTerminfoDirs = "/agyn/terminfo:"
 )
 
-// ExitDisplaced is the exit code the SHELL_ATTACH command uses to say the
+// ExitDisplaced is the exit code a persistent shell's command uses to say the
 // shell outlived this session.
 //
 // tmux exits 0 whether a client was detached or its shell ended, and the proxy
@@ -78,6 +78,10 @@ type Command struct {
 	// TTY is false only for SYNC, which carries a binary protocol that a PTY
 	// would corrupt by merging stderr in and translating line endings.
 	TTY bool
+	// Persistent records that the bound command attaches to a shell that
+	// outlives the session. The exit code alone cannot say so: an ephemeral
+	// shell exiting 91 is just an exit status.
+	Persistent bool
 	// Env is bound into the ticket with the command, for the same reason the
 	// command is: what the session runs must not be changeable at attach time.
 	// KEY=VALUE form.
@@ -87,10 +91,15 @@ type Command struct {
 // Resolve maps a session kind to the command the ticket binds. The mapping
 // lives here rather than in the Gateway because it is terminal-session domain
 // logic; the Gateway routes and does not interpret.
-func Resolve(kind terminalproxyv1.SessionKind, command *terminalproxyv1.TerminalCommand, syncRoot, shellID, shellCwd string) (*Command, error) {
-	if kind != terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH {
+//
+// persistent says whether the target workload keeps its shells. It comes from
+// the workload record, never from the caller: whether a shell outlives its
+// connection is the environment's answer, and two clients against one sandbox
+// must not be able to disagree about it.
+func Resolve(kind terminalproxyv1.SessionKind, command *terminalproxyv1.TerminalCommand, syncRoot, shellID, shellCwd string, persistent bool) (*Command, error) {
+	if kind != terminalproxyv1.SessionKind_SESSION_KIND_SHELL {
 		if strings.TrimSpace(shellID) != "" || strings.TrimSpace(shellCwd) != "" {
-			return nil, errors.New("shell_id and shell_cwd are meaningful only for SHELL_ATTACH")
+			return nil, errors.New("shell_id and shell_cwd are meaningful only for SHELL")
 		}
 	}
 
@@ -99,11 +108,17 @@ func Resolve(kind terminalproxyv1.SessionKind, command *terminalproxyv1.Terminal
 		if err := rejectUnused(command, syncRoot); err != nil {
 			return nil, err
 		}
-		return &Command{Shell: DefaultShell, TTY: true}, nil
-
-	case terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH:
-		if err := rejectUnused(command, syncRoot); err != nil {
-			return nil, err
+		// Naming a shell where the workload does not keep them is not an
+		// error. The caller asked for something this environment does not
+		// provide, which is the environment's answer to give — and refusing it
+		// would make every client read a setting it should not have to.
+		if !persistent {
+			return &Command{Shell: DefaultShell, TTY: true}, nil
+		}
+		if strings.TrimSpace(shellID) == "" {
+			// A shell nobody named is a shell nobody will return to, so there
+			// is nothing for persistence to buy.
+			return &Command{Shell: DefaultShell, TTY: true}, nil
 		}
 		return shellAttachCommand(shellID, shellCwd)
 
@@ -205,8 +220,9 @@ func shellAttachCommand(shellID, shellCwd string) (*Command, error) {
 	)
 
 	return &Command{
-		Shell: shell,
-		TTY:   true,
+		Shell:      shell,
+		TTY:        true,
+		Persistent: true,
 		Env: []string{
 			"TMUX_TMPDIR=" + tmuxTmpDir,
 			"TERMINFO_DIRS=" + tmuxTerminfoDirs,
@@ -227,7 +243,7 @@ var shellIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 func ValidateShellID(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", errors.New("shell_id is required for SHELL_ATTACH")
+		return "", errors.New("shell_id is required")
 	}
 	if !shellIDPattern.MatchString(id) {
 		return "", fmt.Errorf("shell_id %q must match %s", id, shellIDPattern)

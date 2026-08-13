@@ -1,7 +1,7 @@
 version: v2beta1
 
 vars:
-  TERMINAL_PROXY_NAMESPACE: platform
+  TERMINAL_PROXY_NAMESPACE: agyn-platform
   # Deployment created by the chart; override if the release name differs.
   TERMINAL_PROXY_DEPLOYMENT: terminal-proxy
   DEV_IMAGE: ghcr.io/agynio/devcontainer-go:1

@@ -233,7 +233,7 @@ func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTick
 	if err := s.authorizeTerminal(ctx, identityID, workload); err != nil {
 		return nil, err
 	}
-	command, err := ticket.Resolve(req.GetKind(), req.GetCommand(), req.GetSyncRoot(), req.GetShellId(), req.GetShellCwd())
+	command, err := ticket.Resolve(req.GetKind(), req.GetCommand(), req.GetSyncRoot(), req.GetShellId(), req.GetShellCwd(), workload.GetPersistentShells())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -337,7 +337,7 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 	exec := &execState{}
 	errCh := make(chan error, 3)
 	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream, claims.TTY) }()
-	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec, claims.TTY, terminalproxyv1.SessionKind(claims.Kind)) }()
+	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec, claims.TTY, claims.Persistent) }()
 	go func() { errCh <- websocketLiveness(sessionCtx, conn, s.webSocketPingInterval, s.webSocketPingTimeout) }()
 	err = <-errCh
 	cancel()
@@ -631,7 +631,7 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
-func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState, tty bool, kind terminalproxyv1.SessionKind) error {
+func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState, tty bool, persistent bool) error {
 	for {
 		resp, err := execStream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -655,7 +655,7 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 			}
 		case *runnerv1.ExecResponse_Exit:
 			exec.markFinished()
-			reason, code := exitReason(event.Exit.GetReason(), event.Exit.GetExitCode(), kind)
+			reason, code := exitReason(event.Exit.GetReason(), event.Exit.GetExitCode(), persistent)
 			if err := writeExit(ctx, conn, code, reason); err != nil {
 				return err
 			}
@@ -732,15 +732,19 @@ func writeExit(ctx context.Context, conn *terminalConn, code int32, reason strin
 }
 
 // exitReason translates the runner's account of an execution into what the
-// client is told. The exit code is consulted for one case only: a SHELL_ATTACH
-// command that ended while its shell survived reports itself with
-// ticket.ExitDisplaced, because the runner sees an ordinary completion and
-// cannot know the difference.
+// client is told. The exit code is consulted for one case only: a command that
+// attached to a persistent shell and ended while that shell survived reports
+// itself with ticket.ExitDisplaced, because the runner sees an ordinary
+// completion and cannot know the difference.
+//
+// Keyed on what the ticket bound rather than on the session kind: the kind no
+// longer says whether a shell persists, and an ephemeral shell exiting 91 is
+// just an exit status.
 //
 // The code is normalized to 0 in that case. A client that reported 91 as the
 // shell's status would be reporting a number the shell never produced.
-func exitReason(reason runnerv1.ExecExitReason, code int32, kind terminalproxyv1.SessionKind) (string, int32) {
-	if kind == terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH &&
+func exitReason(reason runnerv1.ExecExitReason, code int32, persistent bool) (string, int32) {
+	if persistent &&
 		reason == runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED &&
 		code == ticket.ExitDisplaced {
 		return "displaced", 0

@@ -9,7 +9,7 @@ import (
 
 func resolveAttach(t *testing.T, shellID, cwd string) *Command {
 	t.Helper()
-	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH, nil, "", shellID, cwd)
+	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "", shellID, cwd, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestShellAttachIsAttachOrCreate(t *testing.T) {
 	command := resolveAttach(t, "shell-a", "")
 
 	if !command.TTY {
-		t.Fatal("SHELL_ATTACH must allocate a PTY")
+		t.Fatal("a persistent shell must allocate a PTY")
 	}
 	for _, want := range []string{"new-session", "-A", "-D", "'shell-a'"} {
 		if !strings.Contains(command.Shell, want) {
@@ -134,18 +134,35 @@ func TestValidateShellCwd(t *testing.T) {
 // something it did not get.
 func TestShellParametersRejectedOnOtherKinds(t *testing.T) {
 	for _, kind := range []terminalproxyv1.SessionKind{
-		terminalproxyv1.SessionKind_SESSION_KIND_SHELL,
 		terminalproxyv1.SessionKind_SESSION_KIND_SYNC,
 		terminalproxyv1.SessionKind_SESSION_KIND_EXEC,
 	} {
-		if _, err := Resolve(kind, nil, "/workspace", "shell-a", ""); err == nil {
+		if _, err := Resolve(kind, nil, "/workspace", "shell-a", "", true); err == nil {
 			t.Fatalf("%s accepted shell_id", kind)
 		}
 	}
 }
 
-func TestShellAttachRequiresAnID(t *testing.T) {
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH, nil, "", "", ""); err == nil {
-		t.Fatal("accepted SHELL_ATTACH with no shell_id")
+// A shell nobody named is a shell nobody will return to, so it is an ordinary
+// ephemeral one rather than an error.
+func TestUnnamedShellIsEphemeral(t *testing.T) {
+	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "", "", "", true)
+	if err != nil {
+		t.Fatalf("rejected an unnamed shell: %v", err)
+	}
+	if command.Shell != DefaultShell {
+		t.Fatalf("unnamed shell was not the plain one: %s", command.Shell)
+	}
+}
+
+// The environment decides, not the caller: naming a shell where the workload
+// does not keep them gets a working ephemeral shell rather than a refusal.
+func TestNamedShellIsEphemeralWhenWorkloadDoesNotPersist(t *testing.T) {
+	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "", "shell-a", "/workspace", false)
+	if err != nil {
+		t.Fatalf("rejected a named shell on a non-persistent workload: %v", err)
+	}
+	if command.Shell != DefaultShell {
+		t.Fatalf("bound a multiplexer on a non-persistent workload: %s", command.Shell)
 	}
 }

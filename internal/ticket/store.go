@@ -36,11 +36,14 @@ type Claims struct {
 	CommandArgv   []string `json:"command_argv,omitempty"`
 	// Env is bound with the command and for the same reason: what the session
 	// runs must not be changeable at attach time.
-	Env  []string `json:"env,omitempty"`
-	Kind int32    `json:"kind"`
-	TTY           bool     `json:"tty"`
-	IssuedAt      int64    `json:"iat"`
-	ExpiresAt     int64    `json:"exp"`
+	Env []string `json:"env,omitempty"`
+	// Persistent records that the bound command attaches to a shell outliving
+	// this session, which the exit code alone cannot distinguish.
+	Persistent bool  `json:"persistent,omitempty"`
+	Kind       int32 `json:"kind"`
+	TTY        bool  `json:"tty"`
+	IssuedAt   int64 `json:"iat"`
+	ExpiresAt  int64 `json:"exp"`
 }
 
 func NewStore(key []byte) *Store {
@@ -79,6 +82,7 @@ func (s *Store) Issue(identityID, workloadID, containerName string, kind termina
 		CommandShell:  command.Shell,
 		CommandArgv:   command.Argv,
 		Env:           command.Env,
+		Persistent:    command.Persistent,
 		Kind:          int32(kind),
 		TTY:           command.TTY,
 	}
