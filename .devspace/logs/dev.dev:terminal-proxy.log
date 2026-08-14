@@ -147385,3 +147385,13 @@
 {"level":"info","msg":"dev:terminal-proxy sync  Sync started on: ./ \u003c-\u003e /opt/app/data","time":"2026-08-07T16:12:39+02:00"}
 {"level":"info","msg":"dev:terminal-proxy sync  Waiting for initial sync to complete","time":"2026-08-07T16:12:39+02:00"}
 {"level":"info","msg":"dev:terminal-proxy sync  Initial sync completed","time":"2026-08-07T16:12:41+02:00"}
+{"level":"info","msg":"dev:terminal-proxy Waiting for pod to become ready...","time":"2026-08-13T23:32:02+02:00"}
+{"level":"info","msg":"dev:terminal-proxy Selected pod terminal-proxy-59cb4d674b-8wjfx","time":"2026-08-13T23:32:03+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Sync started on: ./ \u003c-\u003e /opt/app/data","time":"2026-08-13T23:32:05+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Waiting for initial sync to complete","time":"2026-08-13T23:32:05+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Initial sync completed","time":"2026-08-13T23:32:07+02:00"}
+{"level":"info","msg":"dev:terminal-proxy Waiting for pod to become ready...","time":"2026-08-14T01:18:46+02:00"}
+{"level":"info","msg":"dev:terminal-proxy Selected pod terminal-proxy-59cb4d674b-8wjfx","time":"2026-08-14T01:18:47+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Sync started on: ./ \u003c-\u003e /opt/app/data","time":"2026-08-14T01:18:48+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Waiting for initial sync to complete","time":"2026-08-14T01:18:48+02:00"}
+{"level":"info","msg":"dev:terminal-proxy sync  Initial sync completed","time":"2026-08-14T01:18:50+02:00"}

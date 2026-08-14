@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -142,7 +143,23 @@ type websocketPinger interface {
 type handshake struct {
 	Cols uint32 `json:"cols"`
 	Rows uint32 `json:"rows"`
+	// Term is the client's own TERM. Optional, because it describes the client
+	// and grants nothing — a client describing itself wrongly only misrenders
+	// its own output.
+	//
+	// It has to come from the client rather than the pod spec, which sets
+	// nothing per connection: a session's command may itself be a
+	// terminal-aware program deciding what it may emit from this value.
+	Term string `json:"term,omitempty"`
 }
+
+// defaultTerm is what a client that named none gets. xterm-compatible, which
+// every consumer the platform ships is.
+const defaultTerm = "xterm-256color"
+
+// termPattern is deliberately narrow: the value reaches the container as an
+// environment variable, and a terminal name is a short token in practice.
+var termPattern = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
 
 type controlFrame struct {
 	Type string `json:"type"`
@@ -216,7 +233,7 @@ func (s *Server) IssueTicket(ctx context.Context, req *terminalproxyv1.IssueTick
 	if err := s.authorizeTerminal(ctx, identityID, workload); err != nil {
 		return nil, err
 	}
-	command, err := ticket.Resolve(req.GetKind(), req.GetCommand(), req.GetSyncRoot())
+	command, err := ticket.Resolve(req.GetKind(), req.GetCommand(), req.GetSyncRoot(), req.GetShellId(), req.GetShellCwd(), workload.GetPersistentShells())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -302,7 +319,7 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 	if err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
-	if err := execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Start{Start: startRequest(claims, targetID)}}); err != nil {
+	if err := execStream.Send(&runnerv1.ExecRequest{Msg: &runnerv1.ExecRequest_Start{Start: startRequest(claims, targetID, hs)}}); err != nil {
 		return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 	}
 	if claims.TTY {
@@ -320,7 +337,7 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 	exec := &execState{}
 	errCh := make(chan error, 3)
 	go func() { errCh <- websocketToExec(sessionCtx, conn.conn, execStream, claims.TTY) }()
-	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec, claims.TTY) }()
+	go func() { errCh <- execToWebsocket(sessionCtx, conn, execStream, exec, claims.TTY, claims.Persistent) }()
 	go func() { errCh <- websocketLiveness(sessionCtx, conn, s.webSocketPingInterval, s.webSocketPingTimeout) }()
 	err = <-errCh
 	cancel()
@@ -475,19 +492,48 @@ func readHandshake(ctx context.Context, conn *websocket.Conn) (handshake, error)
 	if err := json.Unmarshal(data, &hs); err != nil {
 		return handshake{}, errors.New("handshake JSON invalid")
 	}
+	return normalizeHandshake(hs)
+}
+
+func normalizeHandshake(hs handshake) (handshake, error) {
 	if hs.Cols == 0 || hs.Rows == 0 {
 		return handshake{}, errors.New("handshake cols and rows are required")
+	}
+	// A client that named no terminal is one that did not look, not one in
+	// error: nothing sent this field before it existed.
+	hs.Term = strings.TrimSpace(hs.Term)
+	if hs.Term == "" {
+		hs.Term = defaultTerm
+	}
+	if !termPattern.MatchString(hs.Term) {
+		return handshake{}, errors.New("handshake term invalid")
 	}
 	return hs, nil
 }
 
-func startRequest(claims *ticket.Claims, targetID string) *runnerv1.ExecStartRequest {
+func startRequest(claims *ticket.Claims, targetID string, hs handshake) *runnerv1.ExecStartRequest {
+	options := &runnerv1.ExecOptions{
+		// A non-TTY session needs the streams kept apart: one byte of stderr
+		// inside the protocol stream corrupts it beyond recovery.
+		Tty:            claims.TTY,
+		SeparateStderr: !claims.TTY,
+	}
+	// The ticket's environment first, then TERM. A TTY session is the only one
+	// with a terminal to describe, and SYNC speaks a protocol that has no use
+	// for one.
+	for _, kv := range claims.Env {
+		if name, value, ok := strings.Cut(kv, "="); ok {
+			options.Env = append(options.Env, &runnerv1.EnvVar{Name: name, Value: value})
+		}
+	}
+	if claims.TTY {
+		options.Env = append(options.Env, &runnerv1.EnvVar{Name: "TERM", Value: hs.Term})
+	}
+
 	start := &runnerv1.ExecStartRequest{
 		RequestId: claims.ID,
 		TargetId:  targetID,
-		// A non-TTY session needs the streams kept apart: one byte of stderr
-		// inside the protocol stream corrupts it beyond recovery.
-		Options: &runnerv1.ExecOptions{Tty: claims.TTY, SeparateStderr: !claims.TTY},
+		Options:   options,
 	}
 	if len(claims.CommandArgv) > 0 {
 		start.CommandArgv = append([]string(nil), claims.CommandArgv...)
@@ -585,7 +631,7 @@ func websocketToExec(ctx context.Context, conn *websocket.Conn, execStream runne
 	}
 }
 
-func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState, tty bool) error {
+func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv1.RunnerService_ExecClient, exec *execState, tty bool, persistent bool) error {
 	for {
 		resp, err := execStream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -609,8 +655,8 @@ func execToWebsocket(ctx context.Context, conn *terminalConn, execStream runnerv
 			}
 		case *runnerv1.ExecResponse_Exit:
 			exec.markFinished()
-			reason := exitReason(event.Exit.GetReason())
-			if err := writeExit(ctx, conn, event.Exit.GetExitCode(), reason); err != nil {
+			reason, code := exitReason(event.Exit.GetReason(), event.Exit.GetExitCode(), persistent)
+			if err := writeExit(ctx, conn, code, reason); err != nil {
 				return err
 			}
 			return nil
@@ -685,7 +731,28 @@ func writeExit(ctx context.Context, conn *terminalConn, code int32, reason strin
 	return conn.write(ctx, websocket.MessageText, payload)
 }
 
-func exitReason(reason runnerv1.ExecExitReason) string {
+// exitReason translates the runner's account of an execution into what the
+// client is told. The exit code is consulted for one case only: a command that
+// attached to a persistent shell and ended while that shell survived reports
+// itself with ticket.ExitDisplaced, because the runner sees an ordinary
+// completion and cannot know the difference.
+//
+// Keyed on what the ticket bound rather than on the session kind: the kind no
+// longer says whether a shell persists, and an ephemeral shell exiting 91 is
+// just an exit status.
+//
+// The code is normalized to 0 in that case. A client that reported 91 as the
+// shell's status would be reporting a number the shell never produced.
+func exitReason(reason runnerv1.ExecExitReason, code int32, persistent bool) (string, int32) {
+	if persistent &&
+		reason == runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED &&
+		code == ticket.ExitDisplaced {
+		return "displaced", 0
+	}
+	return execExitReason(reason), code
+}
+
+func execExitReason(reason runnerv1.ExecExitReason) string {
 	switch reason {
 	case runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED:
 		return "completed"

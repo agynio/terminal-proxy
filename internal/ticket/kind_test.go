@@ -8,7 +8,7 @@ import (
 )
 
 func TestSyncResolvesToTheEndpointByAbsolutePath(t *testing.T) {
-	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SYNC, nil, "/workspace/project")
+	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SYNC, nil, "/workspace/project", "", "", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -32,13 +32,13 @@ func TestSyncResolvesToTheEndpointByAbsolutePath(t *testing.T) {
 // Silently defaulting the field that selects a command is how an unintended
 // command ends up in a ticket.
 func TestUnspecifiedKindIsRejected(t *testing.T) {
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_UNSPECIFIED, nil, ""); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_UNSPECIFIED, nil, "", "", "", false); err == nil {
 		t.Fatal("expected an unspecified kind to be rejected")
 	}
 }
 
 func TestShellRunsTheProfileBeforePrependingPath(t *testing.T) {
-	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "")
+	command, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "", "", "", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -61,16 +61,16 @@ func TestParametersAreRejectedOnTheWrongKind(t *testing.T) {
 	shellCmd := &terminalproxyv1.TerminalCommand{
 		Command: &terminalproxyv1.TerminalCommand_Shell{Shell: "echo hi"},
 	}
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCmd, ""); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, shellCmd, "", "", "", false); err == nil {
 		t.Fatal("expected a command on SHELL to be rejected")
 	}
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SYNC, shellCmd, "/workspace"); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SYNC, shellCmd, "/workspace", "", "", false); err == nil {
 		t.Fatal("expected a command on SYNC to be rejected")
 	}
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, shellCmd, "/workspace"); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, shellCmd, "/workspace", "", "", false); err == nil {
 		t.Fatal("expected a sync_root on EXEC to be rejected")
 	}
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "/workspace"); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_SHELL, nil, "/workspace", "", "", false); err == nil {
 		t.Fatal("expected a sync_root on SHELL to be rejected")
 	}
 }
@@ -93,13 +93,13 @@ func TestSyncRootLexicalValidation(t *testing.T) {
 }
 
 func TestExecRequiresACommand(t *testing.T) {
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, nil, ""); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, nil, "", "", "", false); err == nil {
 		t.Fatal("expected EXEC without a command to be rejected")
 	}
 	empty := &terminalproxyv1.TerminalCommand{
 		Command: &terminalproxyv1.TerminalCommand_Argv{Argv: &terminalproxyv1.TerminalArgv{Argv: []string{"  "}}},
 	}
-	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, empty, ""); err == nil {
+	if _, err := Resolve(terminalproxyv1.SessionKind_SESSION_KIND_EXEC, empty, "", "", "", false); err == nil {
 		t.Fatal("expected EXEC with an empty argv to be rejected")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 
 	terminalproxyv1 "github.com/agynio/terminal-proxy/.gen/go/agynio/api/terminal_proxy/v1"
@@ -34,6 +35,42 @@ const PathPrefix = `export PATH="` + platformBinDir + `:$PATH"; `
 // keystroke is undecodable and zsh's line editor renders each as <ffffffff>.
 const DefaultShell = `exec /bin/sh -lc 'PATH=` + platformBinDir + `:$PATH LANG=${LANG:-C.UTF-8} exec ${SHELL:-sh}'`
 
+// tmux backs persistent shells. The proxy names it by absolute path and never
+// puts it on a client's PATH: nothing above the container is meant to know
+// what implements a shell.
+const (
+	tmuxBinary = platformBinDir + "/tmux"
+	tmuxConfig = "/agyn/tmux.conf"
+
+	// The platform's server, off the default socket, so an engineer running
+	// their own tmux inside a shell gets their own server and their own
+	// configuration rather than silently joining this one.
+	tmuxSocket = "agyn"
+
+	// Where agynd put the socket. Without this the client looks in the image's
+	// /tmp, finds nothing, and starts a second server — on a path that may be
+	// read-only and with whatever environment that first client happened to
+	// carry.
+	tmuxTmpDir = "/agyn/run"
+
+	// Supplements the image's terminal database rather than replacing it; the
+	// trailing empty element is what ncurses reads as "and the compiled-in
+	// defaults too".
+	tmuxTerminfoDirs = "/agyn/terminfo:"
+)
+
+// ExitDisplaced is the exit code a persistent shell's command uses to say the
+// shell outlived this session.
+//
+// tmux exits 0 whether a client was detached or its shell ended, and the proxy
+// cannot tell those apart from the exit alone. So the bound command asks: if
+// the session still exists, this client was displaced by another. Nothing else
+// can detach a client — the platform configuration binds no prefix key — so a
+// surviving session means exactly one thing.
+//
+// Chosen above the 128+signal range so it cannot collide with a real death.
+const ExitDisplaced = 91
+
 // Command is what a kind resolves to.
 type Command struct {
 	Shell string
@@ -41,18 +78,57 @@ type Command struct {
 	// TTY is false only for SYNC, which carries a binary protocol that a PTY
 	// would corrupt by merging stderr in and translating line endings.
 	TTY bool
+	// Persistent records that the bound command attaches to a shell that
+	// outlives the session. The exit code alone cannot say so: an ephemeral
+	// shell exiting 91 is just an exit status.
+	Persistent bool
+	// Env is bound into the ticket with the command, for the same reason the
+	// command is: what the session runs must not be changeable at attach time.
+	// KEY=VALUE form.
+	Env []string
 }
 
 // Resolve maps a session kind to the command the ticket binds. The mapping
 // lives here rather than in the Gateway because it is terminal-session domain
 // logic; the Gateway routes and does not interpret.
-func Resolve(kind terminalproxyv1.SessionKind, command *terminalproxyv1.TerminalCommand, syncRoot string) (*Command, error) {
+//
+// persistent says whether the target workload keeps its shells. It comes from
+// the workload record, never from the caller: whether a shell outlives its
+// connection is the environment's answer, and two clients against one sandbox
+// must not be able to disagree about it.
+func Resolve(kind terminalproxyv1.SessionKind, command *terminalproxyv1.TerminalCommand, syncRoot, shellID, shellCwd string, persistent bool) (*Command, error) {
+	// SHELL_ATTACH is deprecated and means SHELL. A client mid-rollout still
+	// asking for it deserves a working shell, not an InvalidArgument -- and the
+	// two now mean the same thing, since the workload decides whether the shell
+	// it names persists.
+	if kind == terminalproxyv1.SessionKind_SESSION_KIND_SHELL_ATTACH {
+		kind = terminalproxyv1.SessionKind_SESSION_KIND_SHELL
+	}
+
+	if kind != terminalproxyv1.SessionKind_SESSION_KIND_SHELL {
+		if strings.TrimSpace(shellID) != "" || strings.TrimSpace(shellCwd) != "" {
+			return nil, errors.New("shell_id and shell_cwd are meaningful only for SHELL")
+		}
+	}
+
 	switch kind {
 	case terminalproxyv1.SessionKind_SESSION_KIND_SHELL:
 		if err := rejectUnused(command, syncRoot); err != nil {
 			return nil, err
 		}
-		return &Command{Shell: DefaultShell, TTY: true}, nil
+		// Naming a shell where the workload does not keep them is not an
+		// error. The caller asked for something this environment does not
+		// provide, which is the environment's answer to give — and refusing it
+		// would make every client read a setting it should not have to.
+		if !persistent {
+			return &Command{Shell: DefaultShell, TTY: true}, nil
+		}
+		if strings.TrimSpace(shellID) == "" {
+			// A shell nobody named is a shell nobody will return to, so there
+			// is nothing for persistence to buy.
+			return &Command{Shell: DefaultShell, TTY: true}, nil
+		}
+		return shellAttachCommand(shellID, shellCwd)
 
 	case terminalproxyv1.SessionKind_SESSION_KIND_EXEC:
 		if strings.TrimSpace(syncRoot) != "" {
@@ -114,6 +190,96 @@ func execCommand(command *terminalproxyv1.TerminalCommand) (*Command, error) {
 	}
 }
 
+// shellAttachCommand binds attach-or-create for one named shell.
+//
+// One command covers both cases on purpose: -A attaches when the session
+// exists and creates it when it does not, which is what makes reconnecting and
+// restoring-after-a-restart the same path. A caller passes its stored
+// directory every time and -c applies it only on creation.
+//
+// -D displaces whatever else held the shell. One shell carries one
+// attachment: it is what makes a page reload immediate rather than a wait for
+// the previous client's missed pongs, and it removes the question of whose
+// size a shared PTY takes.
+func shellAttachCommand(shellID, shellCwd string) (*Command, error) {
+	id, err := ValidateShellID(shellID)
+	if err != nil {
+		return nil, err
+	}
+	cwd, err := ValidateShellCwd(shellCwd)
+	if err != nil {
+		return nil, err
+	}
+
+	attach := []string{
+		quote(tmuxBinary), "-L", tmuxSocket, "-f", quote(tmuxConfig),
+		"new-session", "-A", "-D", "-s", quote(id),
+	}
+	if cwd != "" {
+		attach = append(attach, "-c", quote(cwd))
+	}
+
+	// "=" anchors the lookup to the whole name; tmux otherwise resolves a
+	// target by prefix, and one shell's id can be another's prefix.
+	shell := fmt.Sprintf(
+		`%s; rc=$?; %s -L %s has-session -t %s 2>/dev/null && exit %d; exit $rc`,
+		strings.Join(attach, " "),
+		quote(tmuxBinary), tmuxSocket, quote("="+id), ExitDisplaced,
+	)
+
+	return &Command{
+		Shell:      shell,
+		TTY:        true,
+		Persistent: true,
+		Env: []string{
+			"TMUX_TMPDIR=" + tmuxTmpDir,
+			"TERMINFO_DIRS=" + tmuxTerminfoDirs,
+		},
+	}, nil
+}
+
+var shellIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// ValidateShellID keeps a ticket honest about what it names. '.' and ':' are
+// excluded beyond what the pattern already rejects because tmux reads them as
+// target separators, so a name carrying either addresses something other than
+// the shell the caller asked for.
+//
+// This is not a privilege check. Anyone who may open a shell in a container
+// can reach every shell in it from inside; what the id has to be is
+// unambiguous, not secret.
+func ValidateShellID(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", errors.New("shell_id is required")
+	}
+	if !shellIDPattern.MatchString(id) {
+		return "", fmt.Errorf("shell_id %q must match %s", id, shellIDPattern)
+	}
+	return id, nil
+}
+
+// ValidateShellCwd is the lexical half of the same job ValidateSyncRoot does,
+// with one addition: the value is interpolated into a shell command, so a
+// quote in it would end the string it was meant to sit inside.
+//
+// Optional — a shell with no directory starts wherever the image puts it.
+func ValidateShellCwd(cwd string) (string, error) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return "", nil
+	}
+	if err := checkAbsoluteNoTraversal(cwd, "shell_cwd"); err != nil {
+		return "", err
+	}
+	if strings.ContainsAny(cwd, "'\x00\n\r") {
+		return "", fmt.Errorf("shell_cwd %q contains a quote or control character", cwd)
+	}
+	return path.Clean(cwd), nil
+}
+
+func quote(value string) string { return "'" + value + "'" }
+
 // ValidateSyncRoot is the lexical half of root validation: absolute,
 // normalized, no traversal. The other half — resolving symlinks and confining
 // the result to the workspace mount — can only happen inside the container,
@@ -123,18 +289,25 @@ func ValidateSyncRoot(root string) (string, error) {
 	if root == "" {
 		return "", errors.New("sync_root is required for SYNC")
 	}
-	if !strings.HasPrefix(root, "/") {
-		return "", fmt.Errorf("sync_root %q is not absolute", root)
+	if err := checkAbsoluteNoTraversal(root, "sync_root"); err != nil {
+		return "", err
+	}
+	return path.Clean(root), nil
+}
+
+func checkAbsoluteNoTraversal(value, field string) error {
+	if !strings.HasPrefix(value, "/") {
+		return fmt.Errorf("%s %q is not absolute", field, value)
 	}
 	// Checked before cleaning, not after: path.Clean resolves "/workspace/../etc"
 	// to "/etc", so a check on the cleaned form never sees the traversal it was
 	// meant to catch.
-	for _, segment := range strings.Split(root, "/") {
+	for _, segment := range strings.Split(value, "/") {
 		if segment == ".." {
-			return "", fmt.Errorf("sync_root %q traverses upward", root)
+			return fmt.Errorf("%s %q traverses upward", field, value)
 		}
 	}
-	return path.Clean(root), nil
+	return nil
 }
 
 func cleanArgv(argv []string) []string {
