@@ -411,7 +411,11 @@ func TestIssueTicketDoesNotAuthorizeOrIssueForInvalidRequest(t *testing.T) {
 	}
 }
 
-func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
+// A TTY session touches an agent's workload as it touches a sandbox's: an agent
+// that finished its turn is hibernated once it is idle, and a touch is what
+// flips it back to processing. The touches repeat for as long as the session is
+// attached and stop when it ends, so the agent can sleep then.
+func TestAgentWorkloadIsTouchedWhileAttached(t *testing.T) {
 	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
 	workloadID := uuid.NewString()
 	runner := &fakeRunnerClient{}
@@ -426,6 +430,7 @@ func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	}}
 	agents := &fakeAgentsClient{}
 	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, agents, &fakeRunnerDialer{runner: runner})
+	server.touchInterval = 5 * time.Millisecond
 	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{IdentityId: uuid.NewString(), WorkloadId: workloadID, ContainerName: "main", Kind: terminalproxyv1.SessionKind_SESSION_KIND_SHELL})
 	if err != nil {
 		t.Fatalf("issue ticket: %v", err)
@@ -435,16 +440,29 @@ func TestAgentWorkloadDoesNotTouchOrUpdateSandbox(t *testing.T) {
 	writeHandshake(t, conn, 80, 24)
 	_ = runner.recv(t)
 	_ = runner.recv(t)
+
+	// One touch would not do: the activity sweep returns an untouched agent to
+	// idle after the keepalive grace.
+	eventually(t, func() bool { return runners.touchCount() >= 3 })
+	for _, id := range runners.touchIDs() {
+		if id != workloadID {
+			t.Fatalf("touched %s, want the session's workload %s", id, workloadID)
+		}
+	}
+
 	if err := runner.send(&runnerv1.ExecResponse{Event: &runnerv1.ExecResponse_Exit{Exit: &runnerv1.ExecExit{Reason: runnerv1.ExecExitReason_EXEC_EXIT_REASON_COMPLETED}}}); err != nil {
 		t.Fatalf("send exit: %v", err)
 	}
 	_, _, _ = conn.Read(context.Background())
+	eventually(t, runner.contextDone)
 	time.Sleep(20 * time.Millisecond)
-	if runners.touchCount() != 0 {
-		t.Fatalf("expected no touches, got %d", runners.touchCount())
+	touches := runners.touchCount()
+	time.Sleep(50 * time.Millisecond)
+	if count := runners.touchCount(); count != touches {
+		t.Fatalf("touched %d more times after the session ended", count-touches)
 	}
-	if agents.lastSessionSandboxID() != "" {
-		t.Fatalf("expected no sandbox update, got %q", agents.lastSessionSandboxID())
+	if id := agents.lastSessionSandboxID(); id != "" {
+		t.Fatalf("agent session updated last_session_at for %s; only a sandbox has one", id)
 	}
 }
 
@@ -528,6 +546,12 @@ func (f *fakeRunnersClient) touchCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.touches)
+}
+
+func (f *fakeRunnersClient) touchIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.touches...)
 }
 
 type fakeAuthorizationClient struct {
@@ -858,6 +882,48 @@ func TestSyncSessionIsNonTTYTaggedAndSilentOnActivity(t *testing.T) {
 	}
 	if id := agents.lastSessionSandboxID(); id != "" {
 		t.Fatalf("SYNC updated last_session_at for %s; it must not", id)
+	}
+}
+
+// SYNC touches neither kind of workload. Whether a session reports activity
+// follows from its kind, not from who owns the workload: a sync holding an
+// agent awake is the same mistake as one holding a sandbox awake.
+func TestSyncSessionDoesNotTouchAgentWorkload(t *testing.T) {
+	store := ticket.NewStore([]byte("01234567890123456789012345678901"))
+	workloadID := uuid.NewString()
+	runner := &fakeRunnerClient{}
+	runners := &fakeRunnersClient{workload: &runnersv1.Workload{
+		Meta:         &runnersv1.EntityMeta{Id: workloadID},
+		RunnerId:     uuid.NewString(),
+		Status:       runnersv1.WorkloadStatus_WORKLOAD_STATUS_RUNNING,
+		OwnerKind:    runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_AGENT_INSTANCE,
+		OwnerId:      uuid.NewString(),
+		AgentClassId: stringPtr(uuid.NewString()),
+		Containers:   []*runnersv1.Container{{Name: "main", Role: runnersv1.ContainerRole_CONTAINER_ROLE_MAIN}},
+	}}
+	server := newTestServer(t, store, runners, &fakeAuthorizationClient{allowed: true}, &fakeAgentsClient{}, &fakeRunnerDialer{runner: runner})
+	server.touchInterval = 5 * time.Millisecond
+
+	issued, err := server.IssueTicket(context.Background(), &terminalproxyv1.IssueTicketRequest{
+		IdentityId:    uuid.NewString(),
+		WorkloadId:    workloadID,
+		ContainerName: "main",
+		Kind:          terminalproxyv1.SessionKind_SESSION_KIND_SYNC,
+		SyncRoot:      "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("issue ticket: %v", err)
+	}
+
+	conn := dialTestTerminal(t, server, issued.GetTicket())
+	defer conn.CloseNow()
+	if start := runner.recv(t); start.GetStart() == nil {
+		t.Fatalf("expected start, got %v", start)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if count := runners.touchCount(); count != 0 {
+		t.Fatalf("SYNC touched an agent workload %d times; it must touch neither kind", count)
 	}
 }
 

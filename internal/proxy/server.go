@@ -327,12 +327,20 @@ func (s *Server) handleSession(ctx context.Context, conn *terminalConn, claims *
 			return closeWithError(ctx, conn, websocket.StatusInternalError, err.Error())
 		}
 	}
+	// A TTY session touches its workload for as long as it is attached, whoever
+	// owns it. A sandbox would otherwise idle out from under the person using
+	// it, and an agent that finished its turn would be hibernated under them:
+	// a touch is what flips an agent back to processing.
+	//
 	// SYNC sessions never report activity. A background sync session would
 	// otherwise keep a sandbox running for as long as a laptop stayed
 	// connected, defeating the idle timeout and the metering it bounds.
-	if claims.TTY && workload.GetOwnerKind() == runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX {
-		go s.touchSandboxWorkload(sessionCtx, workload.GetMeta().GetId())
-		defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
+	if claims.TTY {
+		go s.touchWorkloadWhileAttached(sessionCtx, workload.GetMeta().GetId())
+		// last_session_at is kept on the sandbox. An agent has no such field.
+		if workload.GetOwnerKind() == runnersv1.RuntimeOwnerKind_RUNTIME_OWNER_KIND_SANDBOX {
+			defer s.updateSandboxLastSession(context.Background(), workload.GetOwnerId())
+		}
 	}
 	exec := &execState{}
 	errCh := make(chan error, 3)
@@ -430,7 +438,7 @@ func terminalAuthorizationTuple(identityID string, workload *runnersv1.Workload)
 	}
 }
 
-func (s *Server) touchSandboxWorkload(ctx context.Context, workloadID string) {
+func (s *Server) touchWorkloadWhileAttached(ctx context.Context, workloadID string) {
 	s.touchWorkload(ctx, workloadID)
 	ticker := time.NewTicker(s.touchInterval)
 	defer ticker.Stop()
